@@ -1,0 +1,2293 @@
+diff --git a/drivers/net/wireless/ath/ath9k/hif_usb.h b/drivers/net/wireless/ath/ath9k/hif_usb.h
+index 02655ed..1d64e3d 100644
+--- a/drivers/net/wireless/ath/ath9k/hif_usb.h
++++ b/drivers/net/wireless/ath/ath9k/hif_usb.h
+@@ -51,12 +51,14 @@ extern int htc_use_dev_fw;
+ #define ATH_USB_TX_STREAM_MODE_TAG 0x697e
+ 
+ /* FIXME: Verify these numbers (with Windows) */
+-#define MAX_TX_URB_NUM  8
++/* CUSTOM BUILD: URB counts doubled (8 -> 16) for higher TX/RX pipelining.
++ * Memory cost: 16x32KiB TX + 16x16KiB RX buffers (~768 KiB total). */
++#define MAX_TX_URB_NUM  16
+ #define MAX_TX_BUF_NUM  256
+ #define MAX_TX_BUF_SIZE 32768
+ #define MAX_TX_AGGR_NUM 20
+ 
+-#define MAX_RX_URB_NUM  8
++#define MAX_RX_URB_NUM  16
+ #define MAX_RX_BUF_SIZE 16384
+ #define MAX_PKT_NUM_IN_TRANSFER 10
+ 
+diff --git a/drivers/net/wireless/ath/ath9k/htc.h b/drivers/net/wireless/ath/ath9k/htc.h
+index 6c33e89..7114b67 100644
+--- a/drivers/net/wireless/ath/ath9k/htc.h
++++ b/drivers/net/wireless/ath/ath9k/htc.h
+@@ -251,7 +251,11 @@ struct ath9k_vif_iter_data {
+ 	u8 mask[ETH_ALEN];
+ };
+ 
+-#define ATH9K_HTC_MAX_STA 8
++/* CUSTOM BUILD: 8 -> 16 stations. Must match ATH_NODE_MAX in the firmware
++ * (open-ath9k-htc-firmware wlan/include/wlan_hdr.h) - BOTH are bumped and
++ * the custom firmware 1.5 links with the 16-node table inside the target's
++ * RAM budget (verified by ram-magpie.ld at build time). */
++#define ATH9K_HTC_MAX_STA 16
+ #define ATH9K_HTC_MAX_TID 8
+ 
+ enum tid_aggr_state {
+@@ -365,6 +369,48 @@ struct ath9k_debug {
+ 	struct ath_tx_stats tx_stats;
+ 	struct ath_rx_stats rx_stats;
+ 	struct ath_skbrx_stats skbrx_stats;
++	/* CUSTOM BUILD: WMI custom ping round-trip bookkeeping */
++	unsigned long custom_ping_count;
++	u32 custom_ping_payload;
++	u32 custom_ping_pong;
++	unsigned long custom_ping_ms;
++	/* CUSTOM BUILD v3-diag: last ping's target-side control-path counters */
++	u32 diag_rx_cmds, diag_send_dones, diag_rsp_entries, diag_rsp_allocfail;
++	u32 diag_pool_memfail, diag_evt_entries;
++	/* CUSTOM BUILD: runtime rate-control profile bookkeeping */
++	u32 rc_profile_step_dn;
++	u32 rc_fixed_rate;
++	unsigned long rc_profile_count;
++	/* CUSTOM BUILD: manual ANI-style firstep level (0..2) */
++	u32 firstep_level;
++	/* CUSTOM BUILD: per-frame TX power override (0..63) */
++	u32 tx_power;
++	/* CUSTOM BUILD v2: firmware-resident extensions */
++	u32 tlm_seq, tlm_uptime_s, tlm_freq_mhz, tlm_nf_dbm, tlm_rx, tlm_phyerr, tlm_ani_level;
++	u32 dbg_last_cmd, dbg_tbl_entries;
++	unsigned long tlm_count;
++	u8 rate_usage[WMI_CUSTOM_RATE_USAGE_MAX];
++	u32 rssi_total;
++	u8 rssi_bins[WMI_CUSTOM_RSSI_HIST_BINS];
++	u32 mf_mode, mf_count;
++	u8 mf_macs[WMI_CUSTOM_MACFILTER_MAX][6];
++	u32 ani_auto, ani_level, ani_errs;
++	/* CUSTOM BUILD v3 */
++	u32 beacons_window, mf_dropped;
++	u32 rc_num_tries, rc_num_rates;
++	u32 baw_size;
++	u32 ack_timeout;
++	u32 freq_note_entries;
++	u8 netflow_count;
++	u8 netflow_macs[WMI_CUSTOM_NETFLOW_MAX][6];
++	u16 netflow_frames[WMI_CUSTOM_NETFLOW_MAX];
++	u32 netflow_bytes[WMI_CUSTOM_NETFLOW_MAX];
++	u8 chan_count;
++	u16 chan_freq[WMI_CUSTOM_CHAN_SURVEY_MAX];
++	s16 chan_nf[WMI_CUSTOM_CHAN_SURVEY_MAX];
++	u32 spec_auto, spec_threshold, spec_active;
++	u8 bb_head, bb_count, bb_page;
++	u32 bb_ent[WMI_CUSTOM_BB_PER_PG];
+ };
+ 
+ void ath9k_htc_get_et_strings(struct ieee80211_hw *hw,
+diff --git a/drivers/net/wireless/ath/ath9k/htc_drv_debug.c b/drivers/net/wireless/ath/ath9k/htc_drv_debug.c
+index 9437d69..8f0960a 100644
+--- a/drivers/net/wireless/ath/ath9k/htc_drv_debug.c
++++ b/drivers/net/wireless/ath/ath9k/htc_drv_debug.c
+@@ -15,6 +15,8 @@
+  */
+ 
+ #include "htc.h"
++#include "ani.h"
++#include "ar9002_phy.h" /* CUSTOM BUILD: ANI-style PHY registers (AR_PHY_FIND_SIG*) */
+ 
+ static ssize_t read_file_tgt_int_stats(struct file *file, char __user *user_buf,
+ 				       size_t count, loff_t *ppos)
+@@ -393,6 +395,1332 @@ static const struct file_operations fops_debug = {
+ 	.llseek = default_llseek,
+ };
+ 
++/* CUSTOM BUILD v3-diag: host-side command-path health. Purely local (no WMI
++ * round trip): tx_seq_id/last_seq_id show whether the host kept ISSUING
++ * commands after the target stopped replying, cmd_timeouts counts every
++ * "Connection timed out". Frozen seq ids + growing timeouts = the host's
++ * send path itself is stuck; growing seq ids = the host sends fine and the
++ * loss is between the host USB and the target's WMI dispatcher. */
++static ssize_t read_file_wmi_diag(struct file *file, char __user *user_buf,
++				  size_t count, loff_t *ppos)
++{
++	struct ath9k_htc_priv *priv = file->private_data;
++	struct wmi *wmi = priv->wmi;
++	char buf[320];
++	unsigned int len;
++	unsigned long flags;
++	u16 tx_seq, last_seq, fail_cmd, fail_seq;
++	u32 timeouts, rsp_count;
++	int fail_errno;
++	unsigned long last_rsp;
++
++	spin_lock_irqsave(&wmi->wmi_lock, flags);
++	tx_seq = wmi->tx_seq_id;
++	last_seq = wmi->last_seq_id;
++	timeouts = wmi->cmd_timeouts;
++	fail_cmd = wmi->last_fail_cmd_id;
++	fail_seq = wmi->last_fail_seq;
++	fail_errno = wmi->last_fail_errno;
++	last_rsp = wmi->last_rsp_jiffies;
++	rsp_count = wmi->rsp_count;
++	spin_unlock_irqrestore(&wmi->wmi_lock, flags);
++
++	len = sprintf(buf, "tx_seq_id=%u last_seq_id=%u cmd_timeouts=%u rsp_count=%u\n",
++		      tx_seq, last_seq, timeouts, rsp_count);
++	if (fail_cmd)
++		len += sprintf(buf + len,
++			       "last_fail: cmd=0x%04x seq=%u errno=%d\n",
++			       fail_cmd, fail_seq, fail_errno);
++	else
++		len += sprintf(buf + len, "last_fail: none\n");
++	if (last_rsp)
++		len += sprintf(buf + len,
++			       "last_ok_rsp: %ums ago\n",
++			       jiffies_to_msecs(jiffies - last_rsp));
++
++	return simple_read_from_buffer(user_buf, count, ppos, buf, len);
++}
++
++static const struct file_operations fops_wmi_diag = {
++	.read = read_file_wmi_diag,
++	.open = simple_open,
++	.owner = THIS_MODULE,
++	.llseek = default_llseek,
++};
++
++/* CUSTOM BUILD: custom WMI ping round trip.
++ * Write an integer payload (e.g. "1234") to send WMI_CUSTOM_PING_CMDID to
++ * the target firmware; read back the last result (echo + target counter). */
++static ssize_t read_file_custom_ping(struct file *file, char __user *user_buf,
++				     size_t count, loff_t *ppos)
++{
++	struct ath9k_htc_priv *priv = file->private_data;
++	char buf[160];
++	unsigned int len;
++
++	len = sprintf(buf,
++		      "pings=%lu last_payload=0x%08x last_pong=%u last_ms=%lu\n"
++		      "diag: rx_cmds=%u send_dones=%u rsp_entries=%u rsp_allocfail=%u pool_memfail=%u evt_entries=%u\n",
++		      priv->debug.custom_ping_count,
++		      priv->debug.custom_ping_payload,
++		      priv->debug.custom_ping_pong,
++		      priv->debug.custom_ping_ms,
++		      priv->debug.diag_rx_cmds,
++		      priv->debug.diag_send_dones,
++		      priv->debug.diag_rsp_entries,
++		      priv->debug.diag_rsp_allocfail,
++		      priv->debug.diag_pool_memfail,
++		      priv->debug.diag_evt_entries);
++	return simple_read_from_buffer(user_buf, count, ppos, buf, len);
++}
++
++static ssize_t write_file_custom_ping(struct file *file,
++				      const char __user *user_buf,
++				      size_t count, loff_t *ppos)
++{
++	struct ath9k_htc_priv *priv = file->private_data;
++	unsigned long payload;
++	u32 echo, pong;
++	u32 diag[6] = {0, 0, 0, 0, 0, 0};
++	unsigned long t0, t1;
++	int ret;
++
++	ret = kstrtoul_from_user(user_buf, count, 0, &payload);
++	if (ret)
++		return ret;
++
++	t0 = jiffies;
++	ret = ath9k_wmi_custom_ping(priv->wmi, (u32)payload, &echo, &pong, diag);
++	t1 = jiffies;
++	if (ret)
++		return ret;
++
++	priv->debug.custom_ping_count++;
++	priv->debug.custom_ping_payload = echo;
++	priv->debug.custom_ping_pong = pong;
++	priv->debug.custom_ping_ms = jiffies_to_msecs(t1 - t0);
++	priv->debug.diag_rx_cmds       = diag[0];
++	priv->debug.diag_send_dones    = diag[1];
++	priv->debug.diag_rsp_entries   = diag[2];
++	priv->debug.diag_rsp_allocfail = diag[3];
++	priv->debug.diag_pool_memfail  = diag[4];
++	priv->debug.diag_evt_entries   = diag[5];
++
++	return count;
++}
++
++static const struct file_operations fops_custom_ping = {
++	.read = read_file_custom_ping,
++	.write = write_file_custom_ping,
++	.open = simple_open,
++	.owner = THIS_MODULE,
++	.llseek = default_llseek,
++};
++
++/* CUSTOM BUILD: runtime rate-control profile (WMI_CUSTOM_RC_PROFILE_CMDID).
++ * Write "1" (clean air) or "2" (noisy air); "0" just queries the target.
++ * Read shows the effective value the target answered with. */
++static ssize_t read_file_rc_profile(struct file *file, char __user *user_buf,
++				    size_t count, loff_t *ppos)
++{
++	struct ath9k_htc_priv *priv = file->private_data;
++	char buf[128];
++	unsigned int len;
++	u32 eff_step, eff_fixed;
++	int ret;
++
++	/* live query: step_dn_inc=0 keeps it, fixed=0xFE keeps it */
++	ret = ath9k_wmi_rc_profile_v3(priv->wmi, 0, 0xFE, 0, 0,
++				      &eff_step, &eff_fixed,
++				      &priv->debug.rc_num_tries,
++				      &priv->debug.rc_num_rates);
++	if (ret)
++		return ret;
++
++	priv->debug.rc_profile_step_dn = eff_step;
++	priv->debug.rc_fixed_rate = eff_fixed;
++
++	len = sprintf(buf,
++		      "step_dn_inc=%u fixed_rate=%u (0xff=auto) num_tries=%u num_rates=%u applied=%lu (live)\n",
++		      eff_step, eff_fixed, priv->debug.rc_num_tries,
++		      priv->debug.rc_num_rates, priv->debug.rc_profile_count);
++	return simple_read_from_buffer(user_buf, count, ppos, buf, len);
++}
++
++static ssize_t write_file_rc_profile(struct file *file,
++				     const char __user *user_buf,
++				     size_t count, loff_t *ppos)
++{
++	struct ath9k_htc_priv *priv = file->private_data;
++	unsigned long val;
++	u32 eff_step, eff_fixed;
++	int ret;
++
++	ret = kstrtoul_from_user(user_buf, count, 0, &val);
++	if (ret)
++		return ret;
++
++	if (val > 2)
++		return -EINVAL;
++
++	ret = ath9k_wmi_rc_profile_v3(priv->wmi, (u32)val, 0xFE, 0, 0,
++				      &eff_step, &eff_fixed,
++				      &priv->debug.rc_num_tries,
++				      &priv->debug.rc_num_rates);
++	if (ret)
++		return ret;
++
++	priv->debug.rc_profile_step_dn = eff_step;
++	priv->debug.rc_fixed_rate = eff_fixed;
++	priv->debug.rc_profile_count++;
++
++	return count;
++}
++
++/* CUSTOM BUILD v3: runtime tries count (1..32; 0 = keep target default).
++ * Rates stay at the 4-series default (per-series runtime = future). */
++static ssize_t read_file_rc_tries(struct file *file, char __user *user_buf,
++				  size_t count, loff_t *ppos)
++{
++	struct ath9k_htc_priv *priv = file->private_data;
++	char buf[96];
++	unsigned int len;
++	u32 eff_step, eff_fixed, eff_tries, eff_rates;
++	int ret;
++
++	ret = ath9k_wmi_rc_profile_v3(priv->wmi, 0, 0xFE, 0, 0,
++				      &eff_step, &eff_fixed,
++				      &eff_tries, &eff_rates);
++	if (ret)
++		return ret;
++
++	priv->debug.rc_num_tries = eff_tries;
++	priv->debug.rc_num_rates = eff_rates;
++
++	len = sprintf(buf, "num_tries=%u num_rates=%u (live)\n",
++		      eff_tries, eff_rates);
++	return simple_read_from_buffer(user_buf, count, ppos, buf, len);
++}
++
++static ssize_t write_file_rc_tries(struct file *file,
++				   const char __user *user_buf,
++				   size_t count, loff_t *ppos)
++{
++	struct ath9k_htc_priv *priv = file->private_data;
++	unsigned long val;
++	u32 eff_step, eff_fixed, eff_tries, eff_rates;
++	int ret;
++
++	ret = kstrtoul_from_user(user_buf, count, 0, &val);
++	if (ret)
++		return ret;
++
++	if (val > 32)
++		return -EINVAL;
++
++	ret = ath9k_wmi_rc_profile_v3(priv->wmi, 0, 0xFE, (u32)val, 0,
++				      &eff_step, &eff_fixed,
++				      &eff_tries, &eff_rates);
++	if (ret)
++		return ret;
++
++	priv->debug.rc_num_tries = eff_tries;
++	priv->debug.rc_num_rates = eff_rates;
++	return count;
++}
++
++static const struct file_operations fops_rc_tries = {
++	.read = read_file_rc_tries,
++	.write = write_file_rc_tries,
++	.open = simple_open,
++	.owner = THIS_MODULE,
++	.llseek = default_llseek,
++};
++
++static const struct file_operations fops_rc_profile = {
++	.read = read_file_rc_profile,
++	.write = write_file_rc_profile,
++	.open = simple_open,
++	.owner = THIS_MODULE,
++	.llseek = default_llseek,
++};
++
++/* CUSTOM BUILD: fixed-rate runtime toggle (WMI_CUSTOM_RC_PROFILE_CMDID).
++ * Write a rate table index (0..127) to force that rate, or 255 for auto RC.
++ * The 11ng rate table indices are typically: 0-3 legacy CCK, 4-11 legacy
++ * OFDM (6..54 Mbps), 12-19 MCS0-7. Read back what the target answered. */
++static ssize_t read_file_rc_fixed(struct file *file, char __user *user_buf,
++				  size_t count, loff_t *ppos)
++{
++	struct ath9k_htc_priv *priv = file->private_data;
++	char buf[96];
++	unsigned int len;
++	u32 eff_step, eff_fixed;
++	int ret;
++
++	/* live query from the target */
++	ret = ath9k_wmi_rc_profile(priv->wmi, 0, 0xFE, &eff_step, &eff_fixed);
++	if (ret)
++		return ret;
++
++	priv->debug.rc_profile_step_dn = eff_step;
++	priv->debug.rc_fixed_rate = eff_fixed;
++
++	len = sprintf(buf,
++		      "fixed_rate=%u (%s) applied=%lu (live)\n",
++		      eff_fixed,
++		      eff_fixed == 0xff ? "auto" : "fixed",
++		      priv->debug.rc_profile_count);
++	return simple_read_from_buffer(user_buf, count, ppos, buf, len);
++}
++
++static ssize_t write_file_rc_fixed(struct file *file,
++				   const char __user *user_buf,
++				   size_t count, loff_t *ppos)
++{
++	struct ath9k_htc_priv *priv = file->private_data;
++	unsigned long val;
++	u32 eff_step, eff_fixed;
++	int ret;
++
++	ret = kstrtoul_from_user(user_buf, count, 0, &val);
++	if (ret)
++		return ret;
++
++	if (val > 0x7f && val != 0xff)
++		return -EINVAL;
++
++	ret = ath9k_wmi_rc_profile_v3(priv->wmi, 0, (u32)val, 0, 0,
++				      &eff_step, &eff_fixed,
++				      &priv->debug.rc_num_tries,
++				      &priv->debug.rc_num_rates);
++	if (ret)
++		return ret;
++
++	priv->debug.rc_profile_step_dn = eff_step;
++	priv->debug.rc_fixed_rate = eff_fixed;
++	priv->debug.rc_profile_count++;
++
++	return count;
++}
++
++static const struct file_operations fops_rc_fixed = {
++	.read = read_file_rc_fixed,
++	.write = write_file_rc_fixed,
++	.open = simple_open,
++	.owner = THIS_MODULE,
++	.llseek = default_llseek,
++};
++
++/* CUSTOM BUILD: per-frame TX power override (WMI_CUSTOM_TXPOWER_CMDID).
++ * The stock firmware hardcodes 60 (of 0..63) in the TX descriptor.
++ * Write 0..63 to set; anything else just queries. */
++static ssize_t read_file_txpower(struct file *file, char __user *user_buf,
++				 size_t count, loff_t *ppos)
++{
++	struct ath9k_htc_priv *priv = file->private_data;
++	char buf[96];
++	unsigned int len;
++	u32 effective;
++	int ret;
++
++	ret = ath9k_wmi_txpower(priv->wmi, 0xFF, &effective);
++	if (ret)
++		return ret;
++
++	priv->debug.tx_power = effective;
++
++	len = sprintf(buf,
++		      "tx_power=%u/63 (live from target)\n",
++		      effective);
++	return simple_read_from_buffer(user_buf, count, ppos, buf, len);
++}
++
++static ssize_t write_file_txpower(struct file *file,
++				  const char __user *user_buf,
++				  size_t count, loff_t *ppos)
++{
++	struct ath9k_htc_priv *priv = file->private_data;
++	unsigned long val;
++	u32 effective;
++	int ret;
++
++	ret = kstrtoul_from_user(user_buf, count, 0, &val);
++	if (ret)
++		return ret;
++
++	if (val > 0x3f)
++		return -EINVAL;
++
++	ret = ath9k_wmi_txpower(priv->wmi, (u32)val, &effective);
++	if (ret)
++		return ret;
++
++	priv->debug.tx_power = effective;
++
++	return count;
++}
++
++static const struct file_operations fops_txpower = {
++	.read = read_file_txpower,
++	.write = write_file_txpower,
++	.open = simple_open,
++	.owner = THIS_MODULE,
++	.llseek = default_llseek,
++};
++
++/* ===== CUSTOM BUILD v4 (thermal) debugfs handlers ===== */
++/* Reads are live governor queries; writes accept "mode <0-3>",
++ * "cap <0-63|255>" and "hooks <0|1>", or a bare number which sets the
++ * mode. cap 0xFF = uncapped; mode bit0 = RSSI-aware cap, bit1 = duty
++ * backoff. "hooks" flips the target RX-hook isolation switch at runtime
++ * (docs/10 bisect tool). */
++static ssize_t read_file_thermal(struct file *file, char __user *user_buf,
++				 size_t count, loff_t *ppos)
++{
++	struct ath9k_htc_priv *priv = file->private_data;
++	char buf[256];
++	unsigned int len;
++	struct wmi_custom_thermal_rsp rsp;
++	int ret;
++
++	ret = ath9k_wmi_thermal(priv->wmi, CUSTOM_TH_QUERY, CUSTOM_TH_CAP_QUERY,
++				0, &rsp);
++	if (ret)
++		return ret;
++
++	len = sprintf(buf,
++		      "mode=%u (bit0=rssi-cap bit1=duty-backoff)\n"
++		      "cap=%u%s backoff=%u\n"
++		      "effective=%u/63 (XmitPower on data frames)\n"
++		      "avg_rssi=%u tx_window=%u rx_window=%u\n",
++		      be32_to_cpu(rsp.mode), be32_to_cpu(rsp.cap),
++		      (be32_to_cpu(rsp.cap) == CUSTOM_TH_CAP_UNCAPPED) ?
++			      " (uncapped)" : "",
++		      be32_to_cpu(rsp.backoff), be32_to_cpu(rsp.effective),
++		      be32_to_cpu(rsp.avg_rssi), be32_to_cpu(rsp.tx_window),
++		      be32_to_cpu(rsp.rx_window));
++	return simple_read_from_buffer(user_buf, count, ppos, buf, len);
++}
++
++static ssize_t write_file_thermal(struct file *file,
++				  const char __user *user_buf,
++				  size_t count, loff_t *ppos)
++{
++	struct ath9k_htc_priv *priv = file->private_data;
++	char kbuf[32];
++	u32 mode = CUSTOM_TH_QUERY, cap = CUSTOM_TH_CAP_QUERY, flags = 0;
++	u32 a, b;
++	struct wmi_custom_thermal_rsp rsp;
++	int ret;
++
++	(void)file;
++
++	if (count > sizeof(kbuf) - 1)
++		return -EINVAL;
++	if (copy_from_user(kbuf, user_buf, count))
++		return -EFAULT;
++	kbuf[count] = '\0';
++
++	if (sscanf(kbuf, "mode %u", &a) == 1) {
++		if (a > 3)
++			return -EINVAL;
++		mode = a;
++	} else if (sscanf(kbuf, "cap %u", &a) == 1) {
++		if (a > 0x3f && a != 0xff)
++			return -EINVAL;
++		cap = a;
++	} else if (sscanf(kbuf, "hooks %u", &a) == 1) {
++		if (a > 1)
++			return -EINVAL;
++		flags = a ? CUSTOM_TH_FLAG_HOOKS_ON : CUSTOM_TH_FLAG_HOOKS_OFF;
++	} else if (sscanf(kbuf, "%u %u", &a, &b) == 2) {
++		if (a > 3 || (b > 0x3f && b != 0xff))
++			return -EINVAL;
++		mode = a;
++		cap = b;
++	} else if (sscanf(kbuf, "%u", &a) == 1) {
++		if (a > 3)
++			return -EINVAL;
++		mode = a;
++	} else {
++		return -EINVAL;
++	}
++
++	ret = ath9k_wmi_thermal(priv->wmi, mode, cap, flags, &rsp);
++	if (ret)
++		return ret;
++
++	return count;
++}
++
++static const struct file_operations fops_thermal = {
++	.read = read_file_thermal,
++	.write = write_file_thermal,
++	.open = simple_open,
++	.owner = THIS_MODULE,
++	.llseek = default_llseek,
++};
++
++/* ===== CUSTOM BUILD v3 debugfs handlers ===== */
++
++static ssize_t read_file_baw(struct file *file, char __user *user_buf,
++			     size_t count, loff_t *ppos)
++{
++	struct ath9k_htc_priv *priv = file->private_data;
++	char buf[96];
++	unsigned int len;
++	u32 eff;
++	int ret;
++
++	ret = ath9k_wmi_baw(priv->wmi, 0xFF, &eff);
++	if (ret)
++		return ret;
++	priv->debug.baw_size = eff;
++
++	len = sprintf(buf, "baw_size=%u (Block-ACK window, power of two)\n", eff);
++	return simple_read_from_buffer(user_buf, count, ppos, buf, len);
++}
++
++static ssize_t write_file_baw(struct file *file, const char __user *user_buf,
++			      size_t count, loff_t *ppos)
++{
++	struct ath9k_htc_priv *priv = file->private_data;
++	unsigned long val;
++	u32 eff;
++	int ret;
++
++	ret = kstrtoul_from_user(user_buf, count, 0, &val);
++	if (ret)
++		return ret;
++
++	if (val < 1 || val > 64)
++		return -EINVAL;
++
++	ret = ath9k_wmi_baw(priv->wmi, (u32)val, &eff);
++	if (ret)
++		return ret;
++
++	priv->debug.baw_size = eff;
++	return count;
++}
++
++static const struct file_operations fops_baw = {
++	.read = read_file_baw,
++	.write = write_file_baw,
++	.open = simple_open,
++	.owner = THIS_MODULE,
++	.llseek = default_llseek,
++};
++
++static ssize_t read_file_ack_timeout(struct file *file, char __user *user_buf,
++				     size_t count, loff_t *ppos)
++{
++	struct ath9k_htc_priv *priv = file->private_data;
++	char buf[96];
++	unsigned int len;
++	u32 cur;
++	int ret;
++
++	/* CUSTOM BUILD v4-fix: the query value MUST be out of the firmware's
++	 * write range (1..0x3FFF). The old query value 0xFF (=255) IS inside
++	 * the range, so every read RE-WROTE AR_TIME_OUT=255 over any value a
++	 * user had set - reads were destructive and the readback always
++	 * showed 255 (fw handler writes any value in 1..0x3FFF). 0 = query. */
++	ret = ath9k_wmi_longdist(priv->wmi, 0, &cur);
++	if (ret)
++		return ret;
++	priv->debug.ack_timeout = cur;
++
++	len = sprintf(buf, "ack_timeout=%u us (long-distance knob, max 0x3FFF)\n", cur);
++	return simple_read_from_buffer(user_buf, count, ppos, buf, len);
++}
++
++static ssize_t write_file_ack_timeout(struct file *file,
++				      const char __user *user_buf,
++				      size_t count, loff_t *ppos)
++{
++	struct ath9k_htc_priv *priv = file->private_data;
++	unsigned long val;
++	u32 cur;
++	int ret;
++
++	ret = kstrtoul_from_user(user_buf, count, 0, &val);
++	if (ret)
++		return ret;
++
++	if (val < 1 || val > 0x3FFF)
++		return -EINVAL;
++
++	ret = ath9k_wmi_longdist(priv->wmi, (u32)val, &cur);
++	if (ret)
++		return ret;
++
++	priv->debug.ack_timeout = cur;
++	return count;
++}
++
++static const struct file_operations fops_ack_timeout = {
++	.read = read_file_ack_timeout,
++	.write = write_file_ack_timeout,
++	.open = simple_open,
++	.owner = THIS_MODULE,
++	.llseek = default_llseek,
++};
++
++static ssize_t read_file_chan_survey(struct file *file, char __user *user_buf,
++				     size_t count, loff_t *ppos)
++{
++	struct ath9k_htc_priv *priv = file->private_data;
++	char buf[512];
++	unsigned int len = 0;
++	u8 cnt;
++	u16 freq[WMI_CUSTOM_CHAN_SURVEY_MAX];
++	s16 nf[WMI_CUSTOM_CHAN_SURVEY_MAX];
++	int ret, i;
++
++	ret = ath9k_wmi_chan_survey(priv->wmi, &cnt, freq, nf);
++	if (ret)
++		return ret;
++
++	priv->debug.chan_count = cnt;
++	memcpy(priv->debug.chan_freq, freq, sizeof(freq));
++	memcpy(priv->debug.chan_nf, nf, sizeof(nf));
++
++	len += sprintf(buf + len, "channel NF survey (%u sampled channels)\n", cnt);
++	for (i = 0; i < cnt; i++)
++		len += sprintf(buf + len, "%u MHz: %d dBm\n", freq[i], nf[i]);
++
++	return simple_read_from_buffer(user_buf, count, ppos, buf, len);
++}
++
++static const struct file_operations fops_chan_survey = {
++	.read = read_file_chan_survey,
++	.open = simple_open,
++	.owner = THIS_MODULE,
++	.llseek = default_llseek,
++};
++
++static ssize_t read_file_netflow(struct file *file, char __user *user_buf,
++				 size_t count, loff_t *ppos)
++{
++	struct ath9k_htc_priv *priv = file->private_data;
++	char buf[768];
++	unsigned int len = 0;
++	u8 cnt;
++	u8 macs[WMI_CUSTOM_NETFLOW_MAX][6];
++	u16 frames[WMI_CUSTOM_NETFLOW_MAX];
++	u32 bytes[WMI_CUSTOM_NETFLOW_MAX];
++	int ret, i;
++
++	ret = ath9k_wmi_netflow(priv->wmi, 0, &cnt, macs, frames, bytes);
++	if (ret)
++		return ret;
++
++	priv->debug.netflow_count = cnt;
++	memcpy(priv->debug.netflow_macs, macs, sizeof(priv->debug.netflow_macs));
++	memcpy(priv->debug.netflow_frames, frames, sizeof(frames));
++	memcpy(priv->debug.netflow_bytes, bytes, sizeof(bytes));
++
++	len += sprintf(buf + len, "mini-NetFlow (per-MAC, %u entries)\n", cnt);
++	for (i = 0; i < cnt; i++)
++		len += sprintf(buf + len, "%pM: frames=%u bytes=%u\n",
++			       macs[i], frames[i], bytes[i]);
++
++	return simple_read_from_buffer(user_buf, count, ppos, buf, len);
++}
++
++static ssize_t write_file_netflow(struct file *file,
++				  const char __user *user_buf,
++				  size_t count, loff_t *ppos)
++{
++	struct ath9k_htc_priv *priv = file->private_data;
++	unsigned long val;
++	u8 cnt;
++	u8 macs[WMI_CUSTOM_NETFLOW_MAX][6];
++	u16 frames[WMI_CUSTOM_NETFLOW_MAX];
++	u32 bytes[WMI_CUSTOM_NETFLOW_MAX];
++	int ret;
++
++	ret = kstrtoul_from_user(user_buf, count, 0, &val);
++	if (ret)
++		return ret;
++
++	if (val != 1)
++		return -EINVAL;
++
++	ret = ath9k_wmi_netflow(priv->wmi, 1, &cnt, macs, frames, bytes);
++	if (ret)
++		return ret;
++	return count;
++}
++
++static const struct file_operations fops_netflow = {
++	.read = read_file_netflow,
++	.write = write_file_netflow,
++	.open = simple_open,
++	.owner = THIS_MODULE,
++	.llseek = default_llseek,
++};
++
++static ssize_t read_file_auto_spec(struct file *file, char __user *user_buf,
++				   size_t count, loff_t *ppos)
++{
++	struct ath9k_htc_priv *priv = file->private_data;
++	char buf[160];
++	unsigned int len;
++	u32 state, th, active;
++	int ret;
++
++	ret = ath9k_wmi_auto_spec(priv->wmi, 0xFF, 0, &state, &th, &active);
++	if (ret)
++		return ret;
++
++	priv->debug.spec_auto = state;
++	priv->debug.spec_threshold = th;
++	priv->debug.spec_active = active;
++
++	len = sprintf(buf,
++		      "auto_spectral=%u (0=off 1=on) phy_err_trigger=%u per-mille active=%u\n",
++		      state, th, active);
++	return simple_read_from_buffer(user_buf, count, ppos, buf, len);
++}
++
++static ssize_t write_file_auto_spec(struct file *file,
++				    const char __user *user_buf,
++				    size_t count, loff_t *ppos)
++{
++	struct ath9k_htc_priv *priv = file->private_data;
++	char cmdstr[48];
++	char *p, *arg = NULL;
++	unsigned long a1 = 0, a2 = 300;
++	u32 state, th, active;
++	int ret;
++
++	if (count >= sizeof(cmdstr))
++		return -EINVAL;
++	if (copy_from_user(cmdstr, user_buf, count))
++		return -EFAULT;
++	cmdstr[count] = '\0';
++	if (cmdstr[count - 1] == '\n')
++		cmdstr[count - 1] = '\0';
++
++	p = cmdstr;
++	arg = strsep(&p, " ");
++	if (!strcmp(arg, "on") || !strcmp(arg, "1"))
++		a1 = 1;
++	else if (!strcmp(arg, "off") || !strcmp(arg, "0"))
++		a1 = 0;
++	else if (!strcmp(arg, "threshold") && p)
++		a1 = 0xFF;
++	else
++		return -EINVAL;
++
++	if (a1 == 0xFF) {
++		if (kstrtoul(p, 0, &a2) || a2 < 10 || a2 > 900)
++			return -EINVAL;
++	}
++
++	ret = ath9k_wmi_auto_spec(priv->wmi, (u32)a1, (u32)a2,
++				  &state, &th, &active);
++	if (ret)
++		return ret;
++
++	priv->debug.spec_auto = state;
++	priv->debug.spec_threshold = th;
++	priv->debug.spec_active = active;
++	return count;
++}
++
++static const struct file_operations fops_auto_spec = {
++	.read = read_file_auto_spec,
++	.write = write_file_auto_spec,
++	.open = simple_open,
++	.owner = THIS_MODULE,
++	.llseek = default_llseek,
++};
++
++static ssize_t read_file_blackbox(struct file *file, char __user *user_buf,
++				  size_t count, loff_t *ppos)
++{
++	struct ath9k_htc_priv *priv = file->private_data;
++	char buf[512];
++	unsigned int len = 0;
++	u8 head, cnt;
++	u32 ent[WMI_CUSTOM_BB_PER_PG];
++	int ret, j;
++	/* CUSTOM BUILD v4-fix: fw log types are 1-based (custom_log_bb callers
++	 * in the firmware: 1=ani-step .. 8=ack-to) - the old table started at
++	 * index 0, shifting every label down by one ("freq-note" events
++	 * displayed as "spectral", "spec-enable" as "baw", "ack-to" as "?"). */
++	static const char * const names[] = { "(type-0)", "ani-step",
++		"wd-strike", "freq-note", "spectral", "th-cap",
++		"spec-enable", "baw", "ack-to" };
++
++	len += sprintf(buf + len,
++		       "black box (page %u of 4, head=%u count=%u)\n",
++		       priv->debug.bb_page, priv->debug.bb_head,
++		       priv->debug.bb_count);
++	ret = ath9k_wmi_blackbox(priv->wmi, priv->debug.bb_page,
++				 &head, &cnt, ent);
++	if (ret)
++		return ret;
++	priv->debug.bb_head = head;
++	priv->debug.bb_count = cnt;
++	memcpy(priv->debug.bb_ent, ent, sizeof(ent));
++
++	for (j = 0; j < WMI_CUSTOM_BB_PER_PG; j++) {
++		u32 e = ent[j];
++		u8 type = e >> 24;
++		u32 data = e & 0xFFFFFF;
++		const char *nm = (type < ARRAY_SIZE(names)) ? names[type] : "?";
++
++		if (!e)
++			continue;
++		len += sprintf(buf + len, "%s: %u\n", nm, data);
++	}
++
++	return simple_read_from_buffer(user_buf, count, ppos, buf, len);
++}
++
++static ssize_t write_file_blackbox(struct file *file,
++				   const char __user *user_buf,
++				   size_t count, loff_t *ppos)
++{
++	struct ath9k_htc_priv *priv = file->private_data;
++	unsigned long val;
++	int ret;
++
++	ret = kstrtoul_from_user(user_buf, count, 0, &val);
++	if (ret)
++		return ret;
++
++	if (val >= WMI_CUSTOM_BB_PAGES)
++		return -EINVAL;
++
++	priv->debug.bb_page = (u8)val;
++	return count;
++}
++
++static const struct file_operations fops_blackbox = {
++	.read = read_file_blackbox,
++	.write = write_file_blackbox,
++	.open = simple_open,
++	.owner = THIS_MODULE,
++	.llseek = default_llseek,
++};
++
++/* CUSTOM BUILD: live noise floor monitor + raw CCA threshold knob.
++ * Read: chain-0 noise floor in signed dBm (AR_PHY_CCA bits 19..27).
++ * Write: raw minCCA threshold byte (AR_PHY_CCA bits 0..7, signed dBm
++ * 2's complement) - advanced knob; a channel change resets it. */
++#define CUSTOM_CCA_THRESH     0x000000FF
++#define CUSTOM_CCA_THRESH_S   0
++
++/* CUSTOM BUILD v4-fix: checked single-register WMI access. The stock
++ * REG_READ/REG_RMW_FIELD helpers swallow failures (ath9k_regread returns
++ * -1 = 0xFFFFFFFF on WMI failure), which debugfs then renders as plausible
++ * values: nf=-1 dBm and firstep=63/63 were observed LIVE while the control
++ * channel was wedged - sentinels, not measurements. These helpers
++ * propagate the real errno to the reader instead.
++ * v4-fix 2: the target is woken around the access - with the chip in
++ * power-save (idle interface) MAC/PHY registers read garbage (ack_timeout
++ * showed 16111 on a sleeping target) and writes do not commit. */
++static int dbg_reg_read(struct ath9k_htc_priv *priv, u32 reg, u32 *val)
++{
++	__be32 v = 0, addr = cpu_to_be32(reg);
++	int ret;
++
++	ath9k_htc_ps_wakeup(priv);
++	ret = ath9k_wmi_cmd(priv->wmi, WMI_REG_READ_CMDID,
++			    (u8 *)&addr, sizeof(addr),
++			    (u8 *)&v, sizeof(v), 100);
++	ath9k_htc_ps_restore(priv);
++	if (ret)
++		return ret;
++	*val = be32_to_cpu(v);
++	return 0;
++}
++
++static int dbg_reg_write(struct ath9k_htc_priv *priv, u32 reg, u32 val)
++{
++	__be32 w[2] = { cpu_to_be32(reg), cpu_to_be32(val) };
++	__be32 status = 0;
++	int ret;
++
++	ath9k_htc_ps_wakeup(priv);
++	ret = ath9k_wmi_cmd(priv->wmi, WMI_REG_WRITE_CMDID,
++			    (u8 *)w, sizeof(w),
++			    (u8 *)&status, sizeof(status), 100);
++	ath9k_htc_ps_restore(priv);
++	return ret;
++}
++
++/* read-modify-write with verification: fails if the readback does not
++ * reflect the written bits (fire-and-forget regwrite is not acceptable).
++ * The readback is retried a few times: PHY register writes commit through
++ * the MAC/PHY interface and an immediate read can still observe the
++ * pre-write value (observed live as a spurious -EIO on AR_PHY_FIND_SIG). */
++#define DBG_REG_VERIFY_ATTEMPTS 3
++
++static int dbg_reg_rmw_verify(struct ath9k_htc_priv *priv, u32 reg,
++			      u32 mask, u32 shift, u32 value)
++{
++	u32 val, new, rb;
++	int ret, i;
++
++	ret = dbg_reg_read(priv, reg, &val);
++	if (ret)
++		return ret;
++
++	new = (val & ~mask) | ((value << shift) & mask);
++	ret = dbg_reg_write(priv, reg, new);
++	if (ret)
++		return ret;
++
++	for (i = 0; i < DBG_REG_VERIFY_ATTEMPTS; i++) {
++		ret = dbg_reg_read(priv, reg, &rb);
++		if (ret)
++			return ret;
++		if ((rb & mask) == ((value << shift) & mask))
++			return 0;
++		usleep_range(1000, 2000);
++	}
++	return -EIO;
++}
++
++static ssize_t read_file_nf(struct file *file, char __user *user_buf,
++			    size_t count, loff_t *ppos)
++{
++	struct ath9k_htc_priv *priv = file->private_data;
++	char buf[128];
++	unsigned int len;
++	u32 val;
++	int nf, ret;
++
++	ret = dbg_reg_read(priv, AR_PHY_CCA, &val);
++	if (ret)
++		return ret;   /* honest error (e.g. -ETIMEDOUT), no sentinel */
++
++	/* CUSTOM BUILD v4.1 NF fix (Phase 3.3): AR9002/9271 stores MINCCA at
++	 * bits 28..20 — AR9280_PHY_MINCCA_PWR (shift 20), matching stock
++	 * ar9002_hw_do_getnf(). The AR5008-era AR_PHY_MINCCA_PWR (shift 19)
++	 * reads the field one bit low. raw= is printed so the decode can be
++	 * cross-checked offline against ath9k hw NF limits (9271: -127..-116). */
++	nf = sign_extend32(MS(val, AR9280_PHY_MINCCA_PWR), 8);
++	len = sprintf(buf,
++		      "noise_floor=%d dBm (chain0, live)\nraw=0x%08x\n",
++		      nf, val);
++	return simple_read_from_buffer(user_buf, count, ppos, buf, len);
++}
++
++static ssize_t write_file_nf(struct file *file,
++			     const char __user *user_buf,
++			     size_t count, loff_t *ppos)
++{
++	struct ath9k_htc_priv *priv = file->private_data;
++	unsigned long val;
++	int ret;
++
++	ret = kstrtoul_from_user(user_buf, count, 0, &val);
++	if (ret)
++		return ret;
++
++	if (val > 0xff)
++		return -EINVAL;
++
++	ret = dbg_reg_rmw_verify(priv, AR_PHY_CCA, CUSTOM_CCA_THRESH,
++				 CUSTOM_CCA_THRESH_S, (u32)val);
++	if (ret)
++		return ret;
++
++	return count;
++}
++
++static const struct file_operations fops_nf = {
++	.read = read_file_nf,
++	.write = write_file_nf,
++	.open = simple_open,
++	.owner = THIS_MODULE,
++	.llseek = default_llseek,
++};
++
++/* CUSTOM BUILD v2: firmware-resident extensions */
++
++static ssize_t read_file_rate_usage(struct file *file, char __user *user_buf,
++				    size_t count, loff_t *ppos)
++{
++	struct ath9k_htc_priv *priv = file->private_data;
++	char buf[1024];
++	unsigned int len = 0;
++	u8 usage[WMI_CUSTOM_RATE_USAGE_MAX];
++	int ret, i;
++
++	ret = ath9k_wmi_rate_usage(priv->wmi, 0, usage);
++	if (ret)
++		return ret;
++
++	memcpy(priv->debug.rate_usage, usage, sizeof(usage));
++
++	len += sprintf(buf + len, "rate_selections (index: count)\n");
++	for (i = 0; i < WMI_CUSTOM_RATE_USAGE_MAX; i++)
++		len += sprintf(buf + len, "%2u: %u\n", i, usage[i]);
++
++	return simple_read_from_buffer(user_buf, count, ppos, buf, len);
++}
++
++static ssize_t write_file_rate_usage(struct file *file,
++				     const char __user *user_buf,
++				     size_t count, loff_t *ppos)
++{
++	struct ath9k_htc_priv *priv = file->private_data;
++	unsigned long val;
++	u8 usage[WMI_CUSTOM_RATE_USAGE_MAX];
++	int ret;
++
++	ret = kstrtoul_from_user(user_buf, count, 0, &val);
++	if (ret)
++		return ret;
++
++	if (val != 1)
++		return -EINVAL;
++
++	ret = ath9k_wmi_rate_usage(priv->wmi, 1, usage);
++	if (ret)
++		return ret;
++
++	memcpy(priv->debug.rate_usage, usage, sizeof(usage));
++	return count;
++}
++
++static const struct file_operations fops_rate_usage = {
++	.read = read_file_rate_usage,
++	.write = write_file_rate_usage,
++	.open = simple_open,
++	.owner = THIS_MODULE,
++	.llseek = default_llseek,
++};
++
++static ssize_t read_file_telemetry(struct file *file, char __user *user_buf,
++				   size_t count, loff_t *ppos)
++{
++	struct ath9k_htc_priv *priv = file->private_data;
++	char buf[256];
++	unsigned int len;
++
++	len = sprintf(buf,
++		      "seq=%u uptime_s=%u freq_mhz=%u nf=%d rx_frames=%u phy_errs=%u ani_level=%u samples=%lu\n"
++		      "dbg: last_cmd=0x%04x tbl_entries=%u beacons=%u dropped=%u\n",
++		      priv->debug.tlm_seq,
++		      priv->debug.tlm_uptime_s,
++		      priv->debug.tlm_freq_mhz,
++		      (int)priv->debug.tlm_nf_dbm,
++		      priv->debug.tlm_rx,
++		      priv->debug.tlm_phyerr,
++		      priv->debug.tlm_ani_level,
++		      priv->debug.tlm_count,
++		      priv->debug.dbg_last_cmd,
++		      priv->debug.dbg_tbl_entries,
++		      priv->debug.beacons_window,
++		      priv->debug.mf_dropped);
++	return simple_read_from_buffer(user_buf, count, ppos, buf, len);
++}
++
++static const struct file_operations fops_telemetry = {
++	.read = read_file_telemetry,
++	.open = simple_open,
++	.owner = THIS_MODULE,
++	.llseek = default_llseek,
++};
++
++static ssize_t read_file_rssi_hist(struct file *file, char __user *user_buf,
++				   size_t count, loff_t *ppos)
++{
++	struct ath9k_htc_priv *priv = file->private_data;
++	char buf[1024];
++	unsigned int len = 0;
++	u32 total = 0;
++	u8 bins[WMI_CUSTOM_RSSI_HIST_BINS];
++	int ret, i;
++
++	ret = ath9k_wmi_rssi_hist(priv->wmi, 0, bins);
++	if (ret)
++		return ret;
++
++	for (i = 0; i < WMI_CUSTOM_RSSI_HIST_BINS; i++)
++		total += bins[i];
++	priv->debug.rssi_total = total;
++	memcpy(priv->debug.rssi_bins, bins, sizeof(bins));
++
++	len += sprintf(buf + len,
++		       "rssi_histogram (bin=rssi offset, frames=%u)\n", total);
++	for (i = 0; i < WMI_CUSTOM_RSSI_HIST_BINS; i++)
++		if (bins[i])
++			len += sprintf(buf + len, "%2u: %u\n", i, bins[i]);
++
++	return simple_read_from_buffer(user_buf, count, ppos, buf, len);
++}
++
++static ssize_t write_file_rssi_hist(struct file *file,
++				    const char __user *user_buf,
++				    size_t count, loff_t *ppos)
++{
++	struct ath9k_htc_priv *priv = file->private_data;
++	unsigned long val;
++	u8 bins[WMI_CUSTOM_RSSI_HIST_BINS];
++	int ret;
++
++	ret = kstrtoul_from_user(user_buf, count, 0, &val);
++	if (ret)
++		return ret;
++
++	if (val != 1)
++		return -EINVAL;
++
++	ret = ath9k_wmi_rssi_hist(priv->wmi, 1, bins);
++	if (ret)
++		return ret;
++
++	priv->debug.rssi_total = 0;
++	memcpy(priv->debug.rssi_bins, bins, sizeof(bins));
++	return count;
++}
++
++static const struct file_operations fops_rssi_hist = {
++	.read = read_file_rssi_hist,
++	.write = write_file_rssi_hist,
++	.open = simple_open,
++	.owner = THIS_MODULE,
++	.llseek = default_llseek,
++};
++
++static ssize_t read_file_ani_auto(struct file *file, char __user *user_buf,
++				  size_t count, loff_t *ppos)
++{
++	struct ath9k_htc_priv *priv = file->private_data;
++	char buf[128];
++	unsigned int len;
++	u32 state, level, errs;
++	int ret;
++
++	ret = ath9k_wmi_ani_auto(priv->wmi, 0xFF, &state, &level, &errs);
++	if (ret)
++		return ret;
++
++	priv->debug.ani_auto = state;
++	priv->debug.ani_level = level;
++	priv->debug.ani_errs = errs;
++
++	len = sprintf(buf,
++		      "ani_auto=%u (0=manual 1=firmware-adaptive) level=%u window_phy_errs=%u\n",
++		      state, level, errs);
++	return simple_read_from_buffer(user_buf, count, ppos, buf, len);
++}
++
++static ssize_t write_file_ani_auto(struct file *file,
++				   const char __user *user_buf,
++				   size_t count, loff_t *ppos)
++{
++	struct ath9k_htc_priv *priv = file->private_data;
++	unsigned long val;
++	u32 state, level, errs;
++	int ret;
++
++	ret = kstrtoul_from_user(user_buf, count, 0, &val);
++	if (ret)
++		return ret;
++
++	if (val > 1)
++		return -EINVAL;
++
++	ret = ath9k_wmi_ani_auto(priv->wmi, (u32)val, &state, &level, &errs);
++	if (ret)
++		return ret;
++
++	priv->debug.ani_auto = state;
++	priv->debug.ani_level = level;
++	priv->debug.ani_errs = errs;
++	return count;
++}
++
++static const struct file_operations fops_ani_auto = {
++	.read = read_file_ani_auto,
++	.write = write_file_ani_auto,
++	.open = simple_open,
++	.owner = THIS_MODULE,
++	.llseek = default_llseek,
++};
++
++/* macfilter commands: "mode <0|1|2>", "add <idx> <mac>", "del <idx>", "clear" */
++static ssize_t read_file_macfilter(struct file *file, char __user *user_buf,
++				   size_t count, loff_t *ppos)
++{
++	struct ath9k_htc_priv *priv = file->private_data;
++	char buf[512];
++	unsigned int len = 0;
++	u32 mode_out, count_out;
++	int ret, i;
++
++	ret = ath9k_wmi_macfilter(priv->wmi, 0, 0, 0, NULL, &mode_out, &count_out);
++	if (ret)
++		return ret;
++
++	priv->debug.mf_mode = mode_out;
++	priv->debug.mf_count = count_out;
++
++	len += sprintf(buf + len,
++		       "mode=%u (0=off 1=allow 2=block) entries=%u dropped=%u\n",
++		       mode_out, count_out, priv->debug.mf_dropped);
++	for (i = 0; i < WMI_CUSTOM_MACFILTER_MAX; i++) {
++		u8 *m = priv->debug.mf_macs[i];
++
++		if (m[0] | m[1] | m[2] | m[3] | m[4] | m[5])
++			len += sprintf(buf + len,
++				       "%d: %pM\n", i, m);
++	}
++
++	return simple_read_from_buffer(user_buf, count, ppos, buf, len);
++}
++
++static ssize_t write_file_macfilter(struct file *file,
++				    const char __user *user_buf,
++				    size_t count, loff_t *ppos)
++{
++	struct ath9k_htc_priv *priv = file->private_data;
++	char cmdstr[48];
++	char *p, *arg = NULL;
++	unsigned long a1 = 0, a2 = 0;
++	u8 mac[6] = { 0 };
++	u32 mode_out, count_out;
++	int ret;
++
++	if (count >= sizeof(cmdstr))
++		return -EINVAL;
++
++	if (copy_from_user(cmdstr, user_buf, count))
++		return -EFAULT;
++	cmdstr[count] = '\0';
++	if (cmdstr[count - 1] == '\n')
++		cmdstr[count - 1] = '\0';
++
++	p = cmdstr;
++	arg = strsep(&p, " ");
++
++	if (!strcmp(arg, "mode")) {
++		if (kstrtoul(p, 0, &a1) || a1 > 2)
++			return -EINVAL;
++		ret = ath9k_wmi_macfilter(priv->wmi, 1, a1, 0, NULL,
++					  &mode_out, &count_out);
++	} else if (!strcmp(arg, "add")) {
++		arg = strsep(&p, " ");
++		if (!arg || kstrtoul(arg, 0, &a1) || a1 > 7)
++			return -EINVAL;
++		if (!p || !mac_pton(p, mac))
++			return -EINVAL;
++		ret = ath9k_wmi_macfilter(priv->wmi, 2, 0, a1, mac,
++					  &mode_out, &count_out);
++		memcpy(priv->debug.mf_macs[a1], mac, 6);
++	} else if (!strcmp(arg, "del")) {
++		if (kstrtoul(p, 0, &a1) || a1 > 7)
++			return -EINVAL;
++		ret = ath9k_wmi_macfilter(priv->wmi, 3, 0, a1, NULL,
++					  &mode_out, &count_out);
++		memset(priv->debug.mf_macs[a1], 0, 6);
++	} else if (!strcmp(arg, "clear")) {
++		ret = ath9k_wmi_macfilter(priv->wmi, 4, 0, 0, NULL,
++					  &mode_out, &count_out);
++		memset(priv->debug.mf_macs, 0, sizeof(priv->debug.mf_macs));
++	} else {
++		return -EINVAL;
++	}
++
++	if (ret)
++		return ret;
++
++	priv->debug.mf_mode = mode_out;
++	priv->debug.mf_count = count_out;
++	return count;
++}
++
++static const struct file_operations fops_macfilter = {
++	.read = read_file_macfilter,
++	.write = write_file_macfilter,
++	.open = simple_open,
++	.owner = THIS_MODULE,
++	.llseek = default_llseek,
++};
++
++/* CUSTOM BUILD: manual ANI-style PHY sensitivity tuning (borrowed from the
++ * PCI ath9k ANI implementation in ar5008_phy.c). Writes the same registers
++ * the FIRSTEP_LEVEL ANI control writes, via checked WMI-backed register ops
++ * with readback verification (v4-fix: the old fire-and-forget REG_RMW_FIELD
++ * silently no-oped when WMI was wedged and reads rendered 0xFFFFFFFF as
++ * "63"). level 0 = most sensitive (clean air), 2 = most immune (noisy air). */
++static ssize_t read_file_firstep(struct file *file, char __user *user_buf,
++				 size_t count, loff_t *ppos)
++{
++	struct ath9k_htc_priv *priv = file->private_data;
++	char buf[160];
++	unsigned int len;
++	u32 sig, sig_low;
++	int ret;
++
++	ret = dbg_reg_read(priv, AR_PHY_FIND_SIG, &sig);
++	if (ret)
++		return ret;
++	ret = dbg_reg_read(priv, AR_PHY_FIND_SIG_LOW, &sig_low);
++	if (ret)
++		return ret;
++
++	len = sprintf(buf,
++		      "level=%u value=%u find_sig_firstep=%u find_sig_low_firstep=%u\n",
++		      priv->debug.firstep_level, priv->debug.firstep_level * 2,
++		      MS(sig, AR_PHY_FIND_SIG_FIRSTEP),
++		      MS(sig_low, AR_PHY_FIND_SIG_FIRSTEP_LOW));
++	return simple_read_from_buffer(user_buf, count, ppos, buf, len);
++}
++
++static ssize_t write_file_firstep(struct file *file,
++				  const char __user *user_buf,
++				  size_t count, loff_t *ppos)
++{
++	struct ath9k_htc_priv *priv = file->private_data;
++	unsigned long level;
++	u32 value;
++	int ret;
++
++	ret = kstrtoul_from_user(user_buf, count, 0, &level);
++	if (ret)
++		return ret;
++
++	if (level > ATH9K_ANI_FIRSTEP_LVL)
++		return -EINVAL;
++
++	value = level * 2;
++	ret = dbg_reg_rmw_verify(priv, AR_PHY_FIND_SIG,
++				 AR_PHY_FIND_SIG_FIRSTEP,
++				 AR_PHY_FIND_SIG_FIRSTEP_S, value);
++	if (ret)
++		return ret;
++	ret = dbg_reg_rmw_verify(priv, AR_PHY_FIND_SIG_LOW,
++				 AR_PHY_FIND_SIG_FIRSTEP_LOW,
++				 AR_PHY_FIND_SIG_FIRSTEP_LOW_S, value);
++	if (ret)
++		return ret;
++
++	priv->debug.firstep_level = level;
++
++	return count;
++}
++
++static const struct file_operations fops_firstep = {
++	.read = read_file_firstep,
++	.write = write_file_firstep,
++	.open = simple_open,
++	.owner = THIS_MODULE,
++	.llseek = default_llseek,
++};
++
+ /* Ethtool support for get-stats */
+ #define AMKSTR(nm) #nm "_BE", #nm "_BK", #nm "_VI", #nm "_VO"
+ static const char ath9k_htc_gstrings_stats[][ETH_GSTRING_LEN] = {
+@@ -509,6 +1837,46 @@ int ath9k_htc_init_debug(struct ath_hw *ah)
+ 			    priv, &fops_queue);
+ 	debugfs_create_file("debug", 0600, priv->debug.debugfs_phy,
+ 			    priv, &fops_debug);
++	debugfs_create_file("custom_ping", 0600, priv->debug.debugfs_phy,
++			    priv, &fops_custom_ping);
++	debugfs_create_file("wmi_diag", 0400, priv->debug.debugfs_phy,
++			    priv, &fops_wmi_diag);
++	debugfs_create_file("rc_profile", 0600, priv->debug.debugfs_phy,
++			    priv, &fops_rc_profile);
++	debugfs_create_file("rc_tries", 0600, priv->debug.debugfs_phy,
++			    priv, &fops_rc_tries);
++	debugfs_create_file("rc_fixed", 0600, priv->debug.debugfs_phy,
++			    priv, &fops_rc_fixed);
++	debugfs_create_file("firstep", 0600, priv->debug.debugfs_phy,
++			    priv, &fops_firstep);
++	debugfs_create_file("txpower", 0600, priv->debug.debugfs_phy,
++			    priv, &fops_txpower);
++	debugfs_create_file("nf", 0600, priv->debug.debugfs_phy,
++			    priv, &fops_nf);
++	debugfs_create_file("baw", 0600, priv->debug.debugfs_phy,
++			    priv, &fops_baw);
++	debugfs_create_file("ack_timeout", 0600, priv->debug.debugfs_phy,
++			    priv, &fops_ack_timeout);
++	debugfs_create_file("chan_survey", 0400, priv->debug.debugfs_phy,
++			    priv, &fops_chan_survey);
++	debugfs_create_file("netflow", 0600, priv->debug.debugfs_phy,
++			    priv, &fops_netflow);
++	debugfs_create_file("auto_spectral", 0600, priv->debug.debugfs_phy,
++			    priv, &fops_auto_spec);
++	debugfs_create_file("blackbox", 0400, priv->debug.debugfs_phy,
++			    priv, &fops_blackbox);
++	debugfs_create_file("rate_usage", 0600, priv->debug.debugfs_phy,
++			    priv, &fops_rate_usage);
++	debugfs_create_file("telemetry", 0400, priv->debug.debugfs_phy,
++			    priv, &fops_telemetry);
++	debugfs_create_file("rssi_hist", 0600, priv->debug.debugfs_phy,
++			    priv, &fops_rssi_hist);
++	debugfs_create_file("ani_auto", 0600, priv->debug.debugfs_phy,
++			    priv, &fops_ani_auto);
++	debugfs_create_file("macfilter", 0600, priv->debug.debugfs_phy,
++			    priv, &fops_macfilter);
++	debugfs_create_file("thermal", 0600, priv->debug.debugfs_phy,
++			    priv, &fops_thermal);
+ 
+ 	ath9k_cmn_debug_base_eeprom(priv->debug.debugfs_phy, priv->ah);
+ 	ath9k_cmn_debug_modal_eeprom(priv->debug.debugfs_phy, priv->ah);
+diff --git a/drivers/net/wireless/ath/ath9k/htc_drv_init.c b/drivers/net/wireless/ath/ath9k/htc_drv_init.c
+index 3633f9e..160b517 100644
+--- a/drivers/net/wireless/ath/ath9k/htc_drv_init.c
++++ b/drivers/net/wireless/ath/ath9k/htc_drv_init.c
+@@ -1024,6 +1024,7 @@ int ath9k_htc_resume(struct htc_target *htc_handle)
+ 
+ static int __init ath9k_htc_init(void)
+ {
++	pr_info("ath9k_htc: CUSTOM BUILD full - URBs 16/16, MAX_STA 16, debugfs enabled\n");
+ 	if (ath9k_hif_usb_init() < 0) {
+ 		pr_err("No USB devices found, driver not installed\n");
+ 		return -ENODEV;
+diff --git a/drivers/net/wireless/ath/ath9k/htc_drv_main.c b/drivers/net/wireless/ath/ath9k/htc_drv_main.c
+index 8a03bcc..e65b055 100644
+--- a/drivers/net/wireless/ath/ath9k/htc_drv_main.c
++++ b/drivers/net/wireless/ath/ath9k/htc_drv_main.c
+@@ -304,6 +304,13 @@ static int ath9k_htc_set_channel(struct ath9k_htc_priv *priv,
+ 
+ 	htc_start(priv->htc);
+ 
++	/* CUSTOM BUILD v3: notify the target of the current channel so its
++	 * resident NF-survey can pair frequency with noise floor samples. */
++	{
++		u32 entries = 0;
++		ath9k_wmi_freq_note(priv->wmi, priv->ah->curchan->channel, &entries);
++	}
++
+ 	if (!test_bit(ATH_OP_SCANNING, &common->op_flags) &&
+ 	    !(hw->conf.flags & IEEE80211_CONF_OFFCHANNEL))
+ 		ath9k_htc_vif_reconfig(priv);
+diff --git a/drivers/net/wireless/ath/ath9k/wmi.c b/drivers/net/wireless/ath/ath9k/wmi.c
+index 805ad31..d0100a9 100644
+--- a/drivers/net/wireless/ath/ath9k/wmi.c
++++ b/drivers/net/wireless/ath/ath9k/wmi.c
+@@ -83,6 +83,34 @@ static const char *wmi_cmd_to_name(enum wmi_cmd_id wmi_cmd)
+ 		return "WMI_RX_STATS_CMDID";
+ 	case WMI_BITRATE_MASK_CMDID:
+ 		return "WMI_BITRATE_MASK_CMDID";
++	case WMI_CUSTOM_PING_CMDID:
++		return "WMI_CUSTOM_PING_CMDID";
++	case WMI_CUSTOM_RC_PROFILE_CMDID:
++		return "WMI_CUSTOM_RC_PROFILE_CMDID";
++	case WMI_CUSTOM_TXPOWER_CMDID:
++		return "WMI_CUSTOM_TXPOWER_CMDID";
++	case WMI_CUSTOM_RATE_USAGE_CMDID:
++		return "WMI_CUSTOM_RATE_USAGE_CMDID";
++	case WMI_CUSTOM_ANI_AUTO_CMDID:
++		return "WMI_CUSTOM_ANI_AUTO_CMDID";
++	case WMI_CUSTOM_RSSI_HIST_CMDID:
++		return "WMI_CUSTOM_RSSI_HIST_CMDID";
++	case WMI_CUSTOM_MACFILTER_CMDID:
++		return "WMI_CUSTOM_MACFILTER_CMDID";
++	case WMI_CUSTOM_BAW_CMDID:
++		return "WMI_CUSTOM_BAW_CMDID";
++	case WMI_CUSTOM_LONGDIST_CMDID:
++		return "WMI_CUSTOM_LONGDIST_CMDID";
++	case WMI_CUSTOM_FREQ_NOTE_CMDID:
++		return "WMI_CUSTOM_FREQ_NOTE_CMDID";
++	case WMI_CUSTOM_NETFLOW_CMDID:
++		return "WMI_CUSTOM_NETFLOW_CMDID";
++	case WMI_CUSTOM_CHAN_SURVEY_CMDID:
++		return "WMI_CUSTOM_CHAN_SURVEY_CMDID";
++	case WMI_CUSTOM_AUTO_SPEC_CMDID:
++		return "WMI_CUSTOM_AUTO_SPEC_CMDID";
++	case WMI_CUSTOM_BLACKBOX_CMDID:
++		return "WMI_CUSTOM_BLACKBOX_CMDID";
+ 	}
+ 
+ 	return "Bogus";
+@@ -184,6 +212,24 @@ void ath9k_wmi_event_tasklet(struct tasklet_struct *t)
+ 
+ 			ath9k_htc_txstatus(priv, wmi_event);
+ 			break;
++		case WMI_CUSTOM_TELEMETRY_EVENTID: {
++			/* CUSTOM BUILD v2: store the latest target telemetry */
++			struct wmi_custom_telemetry_evt *tlm = wmi_event;
++
++			priv->debug.tlm_seq = be32_to_cpu(tlm->seq);
++			priv->debug.tlm_uptime_s = be32_to_cpu(tlm->uptime_s);
++			priv->debug.tlm_freq_mhz = be32_to_cpu(tlm->freq_mhz);
++			priv->debug.tlm_nf_dbm = be32_to_cpu(tlm->nf_dbm);
++			priv->debug.tlm_rx = be32_to_cpu(tlm->rx_frames);
++			priv->debug.tlm_phyerr = be32_to_cpu(tlm->phy_errs);
++			priv->debug.tlm_ani_level = be32_to_cpu(tlm->ani_level);
++			priv->debug.dbg_last_cmd = be32_to_cpu(tlm->dbg_last_cmd);
++			priv->debug.dbg_tbl_entries = be32_to_cpu(tlm->dbg_tbl_entries);
++			priv->debug.beacons_window = be32_to_cpu(tlm->beacons_window);
++			priv->debug.mf_dropped = be32_to_cpu(tlm->filter_dropped);
++			priv->debug.tlm_count++;
++			break;
++		}
+ 		default:
+ 			break;
+ 		}
+@@ -351,11 +397,22 @@ int ath9k_wmi_cmd(struct wmi *wmi, enum wmi_cmd_id cmd_id,
+ 			wmi_cmd_to_name(cmd_id));
+ 		spin_lock_irqsave(&wmi->wmi_lock, flags);
+ 		wmi->last_seq_id = 0;
++		wmi->cmd_timeouts++;   /* CUSTOM BUILD v3-diag */
++		/* CUSTOM BUILD v4-diag: record exactly what failed last */
++		wmi->last_fail_cmd_id = cmd_id;
++		wmi->last_fail_seq = wmi->tx_seq_id;
++		wmi->last_fail_errno = -ETIMEDOUT;
+ 		spin_unlock_irqrestore(&wmi->wmi_lock, flags);
+ 		mutex_unlock(&wmi->op_mutex);
+ 		return -ETIMEDOUT;
+ 	}
+ 
++	/* CUSTOM BUILD v4-diag: last successful reply timestamp */
++	spin_lock_irqsave(&wmi->wmi_lock, flags);
++	wmi->last_rsp_jiffies = jiffies;
++	wmi->rsp_count++;
++	spin_unlock_irqrestore(&wmi->wmi_lock, flags);
++
+ 	mutex_unlock(&wmi->op_mutex);
+ 
+ 	return 0;
+@@ -367,3 +424,376 @@ int ath9k_wmi_cmd(struct wmi *wmi, enum wmi_cmd_id cmd_id,
+ 
+ 	return ret;
+ }
++
++/* CUSTOM BUILD: send WMI_CUSTOM_PING_CMDID to the target and collect the
++ * response (echoed payload + target-side pong counter + v3-diag control
++ * path counters). diag may be NULL; otherwise diag[0..3] receive:
++ * rx_cmds, send_dones, rsp_entries, rsp_allocfail. */
++int ath9k_wmi_custom_ping(struct wmi *wmi, u32 payload,
++			  u32 *echo_payload, u32 *pong_counter,
++			  u32 diag[4])
++{
++	struct wmi_custom_ping_cmd cmd = { .payload = cpu_to_be32(payload) };
++	struct wmi_custom_ping_rsp rsp;
++	int ret;
++
++	memset(&rsp, 0, sizeof(rsp));
++
++	ret = ath9k_wmi_cmd(wmi, WMI_CUSTOM_PING_CMDID,
++			    (u8 *)&cmd, sizeof(cmd),
++			    (u8 *)&rsp, sizeof(rsp), HZ * 2);
++	if (ret)
++		return ret;
++
++	*echo_payload = be32_to_cpu(rsp.echo_payload);
++	*pong_counter = be32_to_cpu(rsp.pong_counter);
++	if (diag) {
++		diag[0] = be32_to_cpu(rsp.diag_rx_cmds);
++		diag[1] = be32_to_cpu(rsp.diag_send_dones);
++		diag[2] = be32_to_cpu(rsp.diag_rsp_entries);
++		diag[3] = be32_to_cpu(rsp.diag_rsp_allocfail);
++		diag[4] = be32_to_cpu(rsp.diag_pool_memfail);
++		diag[5] = be32_to_cpu(rsp.diag_evt_entries);
++	}
++	return 0;
++}
++
++/* CUSTOM BUILD: set/query the target's runtime rate-control profile.
++ * step_dn_inc 1 = clean-air, 2 = noisy-air, 0 = query only.
++ * fixed_rate_idx 0xFF = auto RC, 0x00-0x7F = fixed, else = keep current. */
++int ath9k_wmi_rc_profile(struct wmi *wmi, u32 step_dn_inc, u32 fixed_rate_idx,
++			 u32 *eff_step_dn, u32 *eff_fixed_rate)
++{
++	struct wmi_custom_rc_profile_cmd cmd = {
++		.step_dn_inc = cpu_to_be32(step_dn_inc),
++		.fixed_rate_idx = cpu_to_be32(fixed_rate_idx),
++	};
++	struct wmi_custom_rc_profile_rsp rsp;
++	int ret;
++
++	memset(&rsp, 0, sizeof(rsp));
++
++	ret = ath9k_wmi_cmd(wmi, WMI_CUSTOM_RC_PROFILE_CMDID,
++			    (u8 *)&cmd, sizeof(cmd),
++			    (u8 *)&rsp, sizeof(rsp), HZ * 2);
++	if (ret)
++		return ret;
++
++	*eff_step_dn = be32_to_cpu(rsp.step_dn_inc);
++	*eff_fixed_rate = be32_to_cpu(rsp.fixed_rate_idx);
++	return 0;
++}
++
++/* CUSTOM BUILD: set/query the per-frame TX power override (0..63). */
++int ath9k_wmi_txpower(struct wmi *wmi, u32 tx_power, u32 *effective)
++{
++	struct wmi_custom_txpower_cmd cmd = {
++		.tx_power = cpu_to_be32(tx_power)
++	};
++	struct wmi_custom_txpower_rsp rsp;
++	int ret;
++
++	memset(&rsp, 0, sizeof(rsp));
++
++	ret = ath9k_wmi_cmd(wmi, WMI_CUSTOM_TXPOWER_CMDID,
++			    (u8 *)&cmd, sizeof(cmd),
++			    (u8 *)&rsp, sizeof(rsp), HZ * 2);
++	if (ret)
++		return ret;
++
++	*effective = be32_to_cpu(rsp.tx_power);
++	return 0;
++}
++
++/* CUSTOM BUILD v4: thermal governor control (mode/cap 0xFF = query-only). */
++int ath9k_wmi_thermal(struct wmi *wmi, u32 mode, u32 cap, u32 flags,
++		      struct wmi_custom_thermal_rsp *out)
++{
++	struct wmi_custom_thermal_cmd cmd = {
++		.mode = cpu_to_be32(mode),
++		.cap = cpu_to_be32(cap),
++		.flags = cpu_to_be32(flags)
++	};
++	struct wmi_custom_thermal_rsp rsp;
++	int ret;
++
++	memset(&rsp, 0, sizeof(rsp));
++
++	ret = ath9k_wmi_cmd(wmi, WMI_CUSTOM_THERMAL_CMDID,
++			    (u8 *)&cmd, sizeof(cmd),
++			    (u8 *)&rsp, sizeof(rsp), HZ * 2);
++	if (ret)
++		return ret;
++
++	*out = rsp;
++	return 0;
++}
++
++/* CUSTOM BUILD v2: per-rate TX usage histogram (reset=1 clears target counters). */
++int ath9k_wmi_rate_usage(struct wmi *wmi, u32 reset, u8 usage[32])
++{
++	struct wmi_custom_rate_usage_cmd cmd = { .reset = cpu_to_be32(reset) };
++	struct wmi_custom_rate_usage_rsp rsp;
++	int ret, i;
++
++	memset(&rsp, 0, sizeof(rsp));
++
++	ret = ath9k_wmi_cmd(wmi, WMI_CUSTOM_RATE_USAGE_CMDID,
++			    (u8 *)&cmd, sizeof(cmd),
++			    (u8 *)&rsp, sizeof(rsp), HZ * 2);
++	if (ret)
++		return ret;
++
++	for (i = 0; i < 32; i++)
++		usage[i] = rsp.usage[i];
++	return 0;
++}
++
++/* CUSTOM BUILD v2: firmware-side adaptive ANI control.
++ * enable 0xFF = query, 0 = manual (host controls), 1 = firmware adaptive. */
++int ath9k_wmi_ani_auto(struct wmi *wmi, u32 enable,
++		       u32 *state, u32 *level, u32 *errs)
++{
++	struct wmi_custom_ani_auto_cmd cmd = { .enable = cpu_to_be32(enable) };
++	struct wmi_custom_ani_auto_rsp rsp;
++	int ret;
++
++	memset(&rsp, 0, sizeof(rsp));
++
++	ret = ath9k_wmi_cmd(wmi, WMI_CUSTOM_ANI_AUTO_CMDID,
++			    (u8 *)&cmd, sizeof(cmd),
++			    (u8 *)&rsp, sizeof(rsp), HZ * 2);
++	if (ret)
++		return ret;
++
++	*state = be32_to_cpu(rsp.enable);
++	*level = be32_to_cpu(rsp.level);
++	*errs = be32_to_cpu(rsp.phy_errs);
++	return 0;
++}
++
++/* CUSTOM BUILD v2: RSSI histogram (64 bins); reset=1 clears target counters. */
++int ath9k_wmi_rssi_hist(struct wmi *wmi, u32 reset, u8 bins[48])
++{
++	struct wmi_custom_rssi_hist_cmd cmd = { .reset = cpu_to_be32(reset) };
++	struct wmi_custom_rssi_hist_rsp rsp;
++	int ret, i;
++
++	memset(&rsp, 0, sizeof(rsp));
++
++	ret = ath9k_wmi_cmd(wmi, WMI_CUSTOM_RSSI_HIST_CMDID,
++			    (u8 *)&cmd, sizeof(cmd),
++			    (u8 *)&rsp, sizeof(rsp), HZ * 2);
++	if (ret)
++		return ret;
++
++	for (i = 0; i < 48; i++)
++		bins[i] = rsp.bins[i];
++	return 0;
++}
++
++/* CUSTOM BUILD v2: radio-level MAC filter configuration. */
++int ath9k_wmi_macfilter(struct wmi *wmi, u32 action, u32 mode, u32 index,
++			const u8 *mac, u32 *mode_out, u32 *count_out)
++{
++	struct wmi_custom_macfilter_cmd cmd = {
++		.action = cpu_to_be32(action),
++		.mode = cpu_to_be32(mode),
++		.index = cpu_to_be32(index),
++	};
++	struct wmi_custom_macfilter_rsp rsp;
++	int ret;
++
++	memset(&rsp, 0, sizeof(rsp));
++
++	if (mac)
++		memcpy(cmd.mac, mac, 6);
++
++	ret = ath9k_wmi_cmd(wmi, WMI_CUSTOM_MACFILTER_CMDID,
++			    (u8 *)&cmd, sizeof(cmd),
++			    (u8 *)&rsp, sizeof(rsp), HZ * 2);
++	if (ret)
++		return ret;
++
++	*mode_out = be32_to_cpu(rsp.mode);
++	*count_out = be32_to_cpu(rsp.count);
++	return 0;
++}
++
++/* ===== CUSTOM BUILD v3 ===== */
++
++int ath9k_wmi_rc_profile_v3(struct wmi *wmi, u32 step, u32 fixed, u32 tries,
++			    u32 rates, u32 *eff_step, u32 *eff_fixed,
++			    u32 *eff_tries, u32 *eff_rates)
++{
++	struct wmi_custom_rc_profile_cmd cmd = {
++		.step_dn_inc = cpu_to_be32(step),
++		.fixed_rate_idx = cpu_to_be32(fixed),
++		.num_tries = cpu_to_be32(tries),
++		.num_rates = cpu_to_be32(rates),
++	};
++	struct wmi_custom_rc_profile_rsp rsp;
++	int ret;
++
++	memset(&rsp, 0, sizeof(rsp));
++
++	ret = ath9k_wmi_cmd(wmi, WMI_CUSTOM_RC_PROFILE_CMDID,
++			    (u8 *)&cmd, sizeof(cmd),
++			    (u8 *)&rsp, sizeof(rsp), HZ * 2);
++	if (ret)
++		return ret;
++
++	*eff_step = be32_to_cpu(rsp.step_dn_inc);
++	*eff_fixed = be32_to_cpu(rsp.fixed_rate_idx);
++	*eff_tries = be32_to_cpu(rsp.num_tries);
++	*eff_rates = be32_to_cpu(rsp.num_rates);
++	return 0;
++}
++
++int ath9k_wmi_baw(struct wmi *wmi, u32 size, u32 *effective)
++{
++	struct wmi_custom_baw_cmd cmd = { .baw_size = cpu_to_be32(size) };
++	struct wmi_custom_baw_rsp rsp;
++	int ret;
++
++	memset(&rsp, 0, sizeof(rsp));
++
++	ret = ath9k_wmi_cmd(wmi, WMI_CUSTOM_BAW_CMDID,
++			    (u8 *)&cmd, sizeof(cmd),
++			    (u8 *)&rsp, sizeof(rsp), HZ * 2);
++	if (ret)
++		return ret;
++
++	*effective = be32_to_cpu(rsp.effective);
++	return 0;
++}
++
++int ath9k_wmi_longdist(struct wmi *wmi, u32 us, u32 *cur_out)
++{
++	struct wmi_custom_longdist_cmd cmd = { .ack_timeout_us = cpu_to_be32(us) };
++	struct wmi_custom_longdist_rsp rsp;
++	int ret;
++
++	memset(&rsp, 0, sizeof(rsp));
++
++	ret = ath9k_wmi_cmd(wmi, WMI_CUSTOM_LONGDIST_CMDID,
++			    (u8 *)&cmd, sizeof(cmd),
++			    (u8 *)&rsp, sizeof(rsp), HZ * 2);
++	if (ret)
++		return ret;
++
++	*cur_out = be32_to_cpu(rsp.ack_timeout_us);
++	return 0;
++}
++
++int ath9k_wmi_freq_note(struct wmi *wmi, u32 freq_mhz, u32 *entries)
++{
++	struct wmi_custom_freq_note_cmd cmd = { .freq_mhz = cpu_to_be32(freq_mhz) };
++	struct wmi_custom_freq_note_rsp rsp;
++	int ret;
++
++	memset(&rsp, 0, sizeof(rsp));
++
++	ret = ath9k_wmi_cmd(wmi, WMI_CUSTOM_FREQ_NOTE_CMDID,
++			    (u8 *)&cmd, sizeof(cmd),
++			    (u8 *)&rsp, sizeof(rsp), HZ / 10);
++	if (ret)
++		return ret;
++
++	*entries = be32_to_cpu(rsp.entries);
++	return 0;
++}
++
++int ath9k_wmi_netflow(struct wmi *wmi, u32 reset, u8 *count,
++		      u8 macs[WMI_CUSTOM_NETFLOW_MAX][6],
++		      u16 frames[WMI_CUSTOM_NETFLOW_MAX],
++		      u32 bytes[WMI_CUSTOM_NETFLOW_MAX])
++{
++	struct wmi_custom_netflow_cmd cmd = { .reset = cpu_to_be32(reset) };
++	struct wmi_custom_netflow_rsp rsp;
++	int ret, i;
++
++	memset(&rsp, 0, sizeof(rsp));
++
++	ret = ath9k_wmi_cmd(wmi, WMI_CUSTOM_NETFLOW_CMDID,
++			    (u8 *)&cmd, sizeof(cmd),
++			    (u8 *)&rsp, sizeof(rsp), HZ * 2);
++	if (ret)
++		return ret;
++
++	*count = rsp.count;
++	for (i = 0; i < WMI_CUSTOM_NETFLOW_MAX; i++) {
++		memcpy(macs[i], rsp.ent[i].mac, 6);
++		frames[i] = be16_to_cpu(rsp.ent[i].frames);
++		bytes[i] = be16_to_cpu(rsp.ent[i].bytes_256) << 8;   /* v4-fix: 256B units */
++	}
++	return 0;
++}
++
++int ath9k_wmi_chan_survey(struct wmi *wmi, u8 *count,
++			  u16 freq[12], s16 nf[12])
++{
++	struct wmi_custom_chan_survey_rsp rsp;
++	int ret, i;
++
++	memset(&rsp, 0, sizeof(rsp));
++
++	ret = ath9k_wmi_cmd(wmi, WMI_CUSTOM_CHAN_SURVEY_CMDID,
++			    NULL, 0,
++			    (u8 *)&rsp, sizeof(rsp), HZ * 2);
++	if (ret)
++		return ret;
++
++	*count = rsp.count;
++	for (i = 0; i < 12; i++) {
++		freq[i] = be16_to_cpu(rsp.ent[i].freq_mhz);
++		nf[i] = rsp.ent[i].nf_dbm;   /* v4-fix: s8 now */
++	}
++	return 0;
++}
++
++int ath9k_wmi_auto_spec(struct wmi *wmi, u32 enable, u32 threshold,
++			u32 *state, u32 *th_out, u32 *active)
++{
++	struct wmi_custom_auto_spec_cmd cmd = {
++		.enable = cpu_to_be32(enable),
++		.threshold = cpu_to_be32(threshold),
++	};
++	struct wmi_custom_auto_spec_rsp rsp;
++	int ret;
++
++	memset(&rsp, 0, sizeof(rsp));
++
++	ret = ath9k_wmi_cmd(wmi, WMI_CUSTOM_AUTO_SPEC_CMDID,
++			    (u8 *)&cmd, sizeof(cmd),
++			    (u8 *)&rsp, sizeof(rsp), HZ * 2);
++	if (ret)
++		return ret;
++
++	*state = be32_to_cpu(rsp.enable);
++	*th_out = be32_to_cpu(rsp.threshold);
++	*active = be32_to_cpu(rsp.active);
++	return 0;
++}
++
++int ath9k_wmi_blackbox(struct wmi *wmi, u32 page,
++		       u8 *head, u8 *count, u32 ent[4])
++{
++	struct wmi_custom_blackbox_cmd cmd = { .page = cpu_to_be32(page) };
++	struct wmi_custom_blackbox_rsp rsp;
++	int ret, i;
++
++	memset(&rsp, 0, sizeof(rsp));
++
++	ret = ath9k_wmi_cmd(wmi, WMI_CUSTOM_BLACKBOX_CMDID,
++			    (u8 *)&cmd, sizeof(cmd),
++			    (u8 *)&rsp, sizeof(rsp), HZ * 2);
++	if (ret)
++		return ret;
++
++	*head = rsp.head;
++	*count = rsp.count;
++	for (i = 0; i < 4; i++)
++		ent[i] = be32_to_cpu(rsp.ent[i]);
++	return 0;
++}
+diff --git a/drivers/net/wireless/ath/ath9k/wmi.h b/drivers/net/wireless/ath/ath9k/wmi.h
+index 5c3b710..af42f3e 100644
+--- a/drivers/net/wireless/ath/ath9k/wmi.h
++++ b/drivers/net/wireless/ath/ath9k/wmi.h
+@@ -36,6 +36,142 @@ struct wmi_fw_version {
+ 
+ } __packed;
+ 
++/* CUSTOM BUILD: custom ping round trip (host -> target -> host) */
++struct wmi_custom_ping_cmd {
++	__be32 payload;
++} __packed;
++
++struct wmi_custom_ping_rsp {
++	__be32 echo_payload;
++	__be32 pong_counter;
++	/* CUSTOM BUILD v3-diag: target-side control-path health counters
++	 * (must match WMI_CUSTOM_PING_RSP in the firmware's wmi.h) */
++	__be32 diag_rx_cmds;
++	__be32 diag_send_dones;
++	__be32 diag_rsp_entries;
++	__be32 diag_rsp_allocfail;
++	__be32 diag_pool_memfail;
++	__be32 diag_evt_entries;
++} __packed;
++
++/* CUSTOM BUILD v3: runtime rate-control profile (full series control) */
++struct wmi_custom_rc_profile_cmd {
++	__be32 step_dn_inc;    /* 1 = clean, 2 = noisy, 0 = query only */
++	__be32 fixed_rate_idx; /* 0xFF = auto RC, 0x00-0x7F = fixed, else keep */
++	__be32 num_tries;      /* 0 = keep, else total tries 1..32 */
++	__be32 num_rates;      /* 0 = keep, else rates in series 1..4 */
++} __packed;
++
++struct wmi_custom_rc_profile_rsp {
++	__be32 step_dn_inc;
++	__be32 fixed_rate_idx;
++	__be32 num_tries;
++	__be32 num_rates;
++} __packed;
++
++/* CUSTOM BUILD: per-frame TX power override (stock fw hardcodes 60) */
++struct wmi_custom_txpower_cmd {
++	__be32 tx_power;   /* 0xFF = query only, 0x00-0x3F = set */
++} __packed;
++
++struct wmi_custom_txpower_rsp {
++	__be32 tx_power;   /* current effective value on the target */
++} __packed;
++
++/* CUSTOM BUILD v4 (thermal): heat governor control. No die-temperature
++ * sensor exists on the AR9271 - the firmware caps PA output power
++ * (descriptor XmitPower) by link quality plus an optional static cap and
++ * an optional duty backoff. Reply is 28B, under the 64B reply budget. */
++#define CUSTOM_TH_QUERY          0xFF   /* mode: query-only */
++/* CUSTOM BUILD v4-fix: cap 0xFF now means UNCAP (docs/12 "cap 255 removes
++ * the cap" - the old firmware intercepted 0xFF as the query marker for both
++ * fields, making uncap unreachable). The cap query marker is 0x100. */
++#define CUSTOM_TH_CAP_QUERY      0x100
++#define CUSTOM_TH_CAP_UNCAPPED   0xFF
++#define CUSTOM_TH_FLAG_HOOKS_ON  0x1   /* set target custom_rx_hooks = 1 */
++#define CUSTOM_TH_FLAG_HOOKS_OFF 0x2   /* set target custom_rx_hooks = 0 */
++
++struct wmi_custom_thermal_cmd {
++	__be32 mode;   /* 0xFF = query; bit0 = RSSI cap, bit1 = duty backoff */
++	__be32 cap;    /* 0x00-0x3F = static cap, 0xFF = uncapped,
++			  0x100 = query only */
++	__be32 flags;  /* CUSTOM_TH_FLAG_* (0 = leave RX hooks untouched) */
++} __packed;
++
++struct wmi_custom_thermal_rsp {
++	__be32 mode;
++	__be32 cap;        /* static cap as configured (0xFF = uncapped) */
++	__be32 backoff;    /* dynamic duty backoff, power steps */
++	__be32 effective;  /* XmitPower applied to data frames right now */
++	__be32 avg_rssi;   /* window-average RSSI (0 = no RX traffic yet) */
++	__be32 tx_window;  /* TX rate-usage delta over the last 2s tick */
++	__be32 rx_window;  /* RX frames over the last 2s tick */
++} __packed;
++
++/* CUSTOM BUILD v2: periodic telemetry event (target -> host) */
++struct wmi_custom_telemetry_evt {
++	__be32 seq;
++	__be32 uptime_s;
++	__be32 freq_mhz;
++	__be32 nf_dbm;
++	__be32 rx_frames;
++	__be32 phy_errs;
++	__be32 ani_level;
++	__be32 dbg_last_cmd;
++	__be32 dbg_tbl_entries;
++	__be32 beacons_window;
++	__be32 filter_dropped;
++} __packed;
++
++/* CUSTOM BUILD v2: per-rate TX usage histogram.
++ * NOTE: replies must stay at or below 64 bytes (pool assert otherwise
++ * halts the target firmware!) - hence u8 bins. */
++#define WMI_CUSTOM_RATE_USAGE_MAX 32
++struct wmi_custom_rate_usage_cmd {
++	__be32 reset;   /* 1 = reset after read */
++} __packed;
++
++struct wmi_custom_rate_usage_rsp {
++	u8 usage[WMI_CUSTOM_RATE_USAGE_MAX];
++} __packed;
++
++/* CUSTOM BUILD v2: firmware-side adaptive ANI */
++struct wmi_custom_ani_auto_cmd {
++	__be32 enable;  /* 0xFF = query, 0 = manual, 1 = firmware adaptive */
++} __packed;
++
++struct wmi_custom_ani_auto_rsp {
++	__be32 enable;
++	__be32 level;
++	__be32 phy_errs;
++} __packed;
++
++/* CUSTOM BUILD v2: RSSI histogram (64 bins, u8 saturated; no total field -
++ * the reply budget is 64 bytes, the driver sums the bins instead) */
++#define WMI_CUSTOM_RSSI_HIST_BINS 48
++struct wmi_custom_rssi_hist_cmd {
++	__be32 reset;   /* 0xFF = query, 1 = reset after read */
++} __packed;
++
++struct wmi_custom_rssi_hist_rsp {
++	u8 bins[WMI_CUSTOM_RSSI_HIST_BINS];
++} __packed;
++
++/* CUSTOM BUILD v2: radio-level MAC filter */
++#define WMI_CUSTOM_MACFILTER_MAX 8
++struct wmi_custom_macfilter_cmd {
++	__be32 action;  /* 0=query, 1=setmode, 2=add, 3=del, 4=clear */
++	__be32 mode;    /* 0 = off, 1 = allow-list, 2 = block-list */
++	__be32 index;   /* entry index 0..7 */
++	u8 mac[6];
++} __packed;
++
++struct wmi_custom_macfilter_rsp {
++	__be32 mode;
++	__be32 count;
++	__be32 dropped;   /* frames dropped by the radio-level filter */
++} __packed;
++
+ struct wmi_event_swba {
+ 	__be64 tsf;
+ 	u8 beacon_pending;
+@@ -113,6 +249,22 @@ enum wmi_cmd_id {
+ 	WMI_RX_STATS_CMDID,
+ 	WMI_BITRATE_MASK_CMDID,
+ 	WMI_REG_RMW_CMDID,
++	/* CUSTOM BUILD: must match WMI_COMMAND_ID in the firmware's wmi.h */
++	WMI_CUSTOM_PING_CMDID,
++	WMI_CUSTOM_RC_PROFILE_CMDID,
++	WMI_CUSTOM_TXPOWER_CMDID,
++	WMI_CUSTOM_RATE_USAGE_CMDID,
++	WMI_CUSTOM_ANI_AUTO_CMDID,
++	WMI_CUSTOM_RSSI_HIST_CMDID,
++	WMI_CUSTOM_MACFILTER_CMDID,
++	WMI_CUSTOM_BAW_CMDID,
++	WMI_CUSTOM_LONGDIST_CMDID,
++	WMI_CUSTOM_FREQ_NOTE_CMDID,
++	WMI_CUSTOM_NETFLOW_CMDID,
++	WMI_CUSTOM_CHAN_SURVEY_CMDID,
++	WMI_CUSTOM_AUTO_SPEC_CMDID,
++	WMI_CUSTOM_BLACKBOX_CMDID,
++	WMI_CUSTOM_THERMAL_CMDID,
+ };
+ 
+ enum wmi_event_id {
+@@ -123,6 +275,8 @@ enum wmi_event_id {
+ 	WMI_BMISS_EVENTID,
+ 	WMI_DELBA_EVENTID,
+ 	WMI_TXSTATUS_EVENTID,
++	/* CUSTOM BUILD v2: periodic telemetry (matches fw WMI_EVENT_ID append) */
++	WMI_CUSTOM_TELEMETRY_EVENTID,
+ };
+ 
+ #define MAX_CMD_NUMBER 62
+@@ -158,6 +312,16 @@ struct wmi {
+ 	u8 *cmd_rsp_buf;
+ 	u32 cmd_rsp_len;
+ 	bool stopped;
++	/* CUSTOM BUILD v3-diag: host-side command-path health */
++	u32 cmd_timeouts;
++	/* CUSTOM BUILD v4-diag: last failed command details + last response
++	 * time, so wmi_diag can say exactly WHAT died and WHEN, not just
++	 * "some timeouts happened". All fields are updated under wmi_lock. */
++	u16 last_fail_cmd_id;
++	u16 last_fail_seq;
++	int last_fail_errno;
++	unsigned long last_rsp_jiffies;
++	u32 rsp_count;
+ 
+ 	struct list_head pending_tx_events;
+ 	spinlock_t event_lock;
+@@ -185,6 +349,35 @@ int ath9k_wmi_cmd(struct wmi *wmi, enum wmi_cmd_id cmd_id,
+ 		  u8 *cmd_buf, u32 cmd_len,
+ 		  u8 *rsp_buf, u32 rsp_len,
+ 		  u32 timeout);
++int ath9k_wmi_custom_ping(struct wmi *wmi, u32 payload,
++			  u32 *echo_payload, u32 *pong_counter,
++			  u32 diag[4]);
++int ath9k_wmi_rc_profile(struct wmi *wmi, u32 step_dn_inc,
++			 u32 fixed_rate_idx,
++			 u32 *eff_step_dn, u32 *eff_fixed_rate);
++int ath9k_wmi_txpower(struct wmi *wmi, u32 tx_power, u32 *effective);
++int ath9k_wmi_thermal(struct wmi *wmi, u32 mode, u32 cap, u32 flags,
++		      struct wmi_custom_thermal_rsp *out);
++int ath9k_wmi_rate_usage(struct wmi *wmi, u32 reset, u8 usage[32]);
++int ath9k_wmi_ani_auto(struct wmi *wmi, u32 enable,
++		       u32 *state, u32 *level, u32 *errs);
++int ath9k_wmi_rssi_hist(struct wmi *wmi, u32 reset, u8 bins[64]);
++int ath9k_wmi_macfilter(struct wmi *wmi, u32 action, u32 mode, u32 index,
++			const u8 *mac, u32 *mode_out, u32 *count_out);
++int ath9k_wmi_rc_profile_v3(struct wmi *wmi, u32 step, u32 fixed, u32 tries,
++			    u32 rates, u32 *eff_step, u32 *eff_fixed,
++			    u32 *eff_tries, u32 *eff_rates);
++int ath9k_wmi_baw(struct wmi *wmi, u32 size, u32 *effective);
++int ath9k_wmi_longdist(struct wmi *wmi, u32 us, u32 *cur_out);
++int ath9k_wmi_freq_note(struct wmi *wmi, u32 freq_mhz, u32 *entries);
++int ath9k_wmi_netflow(struct wmi *wmi, u32 reset, u8 *count,
++		      u8 macs[6][6], u16 frames[6], u32 bytes[6]);
++int ath9k_wmi_chan_survey(struct wmi *wmi, u8 *count,
++			  u16 freq[12], s16 nf[12]);
++int ath9k_wmi_auto_spec(struct wmi *wmi, u32 enable, u32 threshold,
++			u32 *state, u32 *th_out, u32 *active);
++int ath9k_wmi_blackbox(struct wmi *wmi, u32 page,
++		       u8 *head, u8 *count, u32 ent[4]);
+ void ath9k_wmi_event_tasklet(struct tasklet_struct *t);
+ void ath9k_fatal_work(struct work_struct *work);
+ void ath9k_wmi_event_drain(struct ath9k_htc_priv *priv);
+@@ -205,4 +398,86 @@ void ath9k_destroy_wmi(struct ath9k_htc_priv *priv);
+ 				    &cmd_rsp, sizeof(cmd_rsp), HZ*2);	\
+ 	} while (0)
+ 
++/* ===== CUSTOM BUILD v3: firmware-resident services ===== */
++
++struct wmi_custom_baw_cmd {
++	__be32 baw_size;   /* 0xFF = query, else new size */
++} __packed;
++
++struct wmi_custom_baw_rsp {
++	__be32 effective;
++} __packed;
++
++struct wmi_custom_longdist_cmd {
++	__be32 ack_timeout_us;   /* 0xFF = query, else 1..16383 */
++} __packed;
++
++struct wmi_custom_longdist_rsp {
++	__be32 ack_timeout_us;
++} __packed;
++
++struct wmi_custom_freq_note_cmd {
++	__be32 freq_mhz;
++} __packed;
++
++struct wmi_custom_freq_note_rsp {
++	__be32 entries;
++} __packed;
++
++#define WMI_CUSTOM_NETFLOW_MAX 4
++struct wmi_custom_netflow_cmd {
++	__be32 reset;
++} __packed;
++
++/* CUSTOM BUILD v4-fix: bytes is ONE u16 in 256B units (saturating) so the
++ * reply is 44B payload = 56B on the wire, below the 64B EP3 max-packet
++ * boundary that jams the USB controller (the old 12B entry = 52B payload =
++ * exactly 64B). Must match WMI_CUSTOM_NETFLOW_RSP in the firmware wmi.h. */
++struct wmi_custom_netflow_rsp {
++	u8 count;
++	u8 rsv[3];
++	struct {
++		u8 mac[6];
++		__be16 frames;
++		__be16 bytes_256;
++	} ent[WMI_CUSTOM_NETFLOW_MAX];
++} __packed;
++
++#define WMI_CUSTOM_CHAN_SURVEY_MAX 12
++/* CUSTOM BUILD v4-fix: nf is s8 now (was be16) so the reply is 38B payload =
++ * 46B on the wire, below the 64B EP3 max-packet boundary that jams the USB
++ * controller (must match WMI_CUSTOM_CHAN_SURVEY_RSP in the firmware wmi.h). */
++struct wmi_custom_chan_survey_rsp {
++	u8 count;
++	u8 rsv;
++	struct {
++		__be16 freq_mhz;
++		s8 nf_dbm;
++	} ent[WMI_CUSTOM_CHAN_SURVEY_MAX];
++} __packed;
++
++struct wmi_custom_auto_spec_cmd {
++	__be32 enable;
++	__be32 threshold;
++} __packed;
++
++struct wmi_custom_auto_spec_rsp {
++	__be32 enable;
++	__be32 threshold;
++	__be32 active;
++} __packed;
++
++#define WMI_CUSTOM_BB_PAGES   4
++#define WMI_CUSTOM_BB_PER_PG  4
++struct wmi_custom_blackbox_cmd {
++	__be32 page;
++} __packed;
++
++struct wmi_custom_blackbox_rsp {
++	u8 head;
++	u8 count;
++	u8 rsv[2];
++	__be32 ent[WMI_CUSTOM_BB_PER_PG];
++} __packed;
++
+ #endif /* WMI_H */

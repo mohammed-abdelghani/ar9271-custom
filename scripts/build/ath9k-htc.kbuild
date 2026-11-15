@@ -1,0 +1,19 @@
+# CUSTOM BUILD: out-of-tree ath9k_htc + ath9k_common for the AR9271 (TL-WN422G v2)
+# Built with: make -C /lib/modules/$(uname -r)/build M=<this dir> modules
+obj-m += ath9k_htc.o
+ath9k_htc-y := htc_hst.o hif_usb.o wmi.o htc_drv_txrx.o htc_drv_main.o \
+	htc_drv_beacon.o htc_drv_init.o htc_drv_gpio.o htc_drv_debug.o
+
+# CUSTOM BUILD: rebuild ath9k_common WITH spectral scan support.
+# Debian's shipped ath9k_common has CONFIG_ATH9K_COMMON_SPECTRAL unset,
+# which turns the spectral code paths into no-op stubs.
+obj-m += ath9k_common.o
+ath9k_common-y := common.o common-init.o common-beacon.o common-spectral.o
+
+ccflags-y += -DCONFIG_ATH9K_HTC_DEBUGFS -DCONFIG_ATH9K_COMMON_SPECTRAL
+
+# CUSTOM BUILD: compile in ath_dbg() output (Phase 3 observability).
+# ath_dbg is a no-op unless CONFIG_ATH_DEBUG is defined; the runtime mask is
+# /sys/module/ath9k_htc/parameters/debug (default 0 = quiet).
+# Masks: RESET=0x1 FATAL=0x400 WMI=0x2000 (see ath.h enum ATH_DEBUG).
+ccflags-y += -DCONFIG_ATH_DEBUG

@@ -1,0 +1,3 @@
+# AR9271 (TL-WN422G v2, 0cf3:1006): keep USB runtime PM off for this device only.
+# Prevents autosuspend-induced link drops. Scope limited to this VID:PID.
+ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="0cf3", ATTR{idProduct}=="1006", ATTR{power/autosuspend}="-1", ATTR{power/control}="on"

@@ -1,0 +1,27 @@
+# build artifacts (never commit binaries rebuilt locally)
+*.ko
+*.o
+*.mod
+*.mod.c
+*.cmd
+Module.symvers
+modules.order
+.tmp_versions/
+
+# firmware build outputs (repo tree — builds happen in the BUILD_DIR mirror, these are defensive)
+sources/open-ath9k-htc-firmware/toolchain/
+sources/open-ath9k-htc-firmware/target_firmware/htc_9271.fw
+*.elf
+*.map
+
+# local soak/session logs
+*.log
+!docs/test-final-20261115.log
+
+# editor/OS noise
+.vscode/
+.idea/
+__pycache__/
+*.bak.*
+*~
+.DS_Store

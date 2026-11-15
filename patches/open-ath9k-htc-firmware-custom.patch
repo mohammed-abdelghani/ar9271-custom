@@ -1,0 +1,1720 @@
+diff --git a/Makefile b/Makefile
+index de1e0f4..6de12c4 100644
+--- a/Makefile
++++ b/Makefile
+@@ -61,9 +61,13 @@ define MPFR/Compile
+ 	$(call Common/Compile,MPFR, \
+ 		--disable-shared --enable-static \
+ 		--with-gmp=$(TOOLCHAIN_DIR)/inst, \
+-		$(MAKE) && $(MAKE) check && $(MAKE) -j1 install \
++		$(MAKE) && $(MAKE) -j1 install \
+ 	)
+ endef
++# CUSTOM BUILD NOTE: MPFR's `make check` is skipped above. MPFR 4.1.0's
++# testsuite has a documented failure ("tsprintf", 1/183) on glibc >= 2.35
++# because the system printf rounding behaviour changed; the library itself
++# compiles and installs fine (182/183 tests pass).
+ 
+ define MPC/Compile
+ 	$(call Common/Compile,MPC, \
+diff --git a/target_firmware/magpie_fw_dev/target/buf_pool/buf_pool_static.c b/target_firmware/magpie_fw_dev/target/buf_pool/buf_pool_static.c
+index 33a95fb..485b1b9 100755
+--- a/target_firmware/magpie_fw_dev/target/buf_pool/buf_pool_static.c
++++ b/target_firmware/magpie_fw_dev/target/buf_pool/buf_pool_static.c
+@@ -95,11 +95,16 @@ LOCAL void _buf_pool_static_shutdown(pool_handle_t handle)
+     // SHALL NOT BE USED in FW
+ }
+ 
++/* CUSTOM BUILD v3-diag: buffers whose data area failed to allocate at
++ * pool-creation time. Exported through the custom ping reply. */
++A_UINT32 custom_pool_memfail = 0;
++
+ LOCAL void _buf_pool_static_create_pool(pool_handle_t handle, BUF_POOL_ID poolId, int nItems, int nSize)
+ {
+     int i;
+     VBUF *buf;
+     VDESC *desc;
++    A_UINT8 *data;
+ 
+     //BUF_POOL_STATIC_CONTEXT *ctx = (BUF_POOL_STATIC_CONTEXT *)handle;
+ 
+@@ -107,7 +112,20 @@ LOCAL void _buf_pool_static_create_pool(pool_handle_t handle, BUF_POOL_ID poolId
+         buf = VBUF_alloc_vbuf();
+         desc = VDESC_alloc_vdesc();
+ 
+-        desc->buf_addr = (A_UINT8 *)adf_os_mem_alloc(nSize);
++        /* CUSTOM BUILD v3-fix: adf_os_mem_alloc can silently return NULL when
++         * the boot heap is exhausted (the WMI pools are created late, after
++         * HIF/HTC/RX buffers and the 16-node table took their share). A buffer
++         * with a NULL data area enters circulation, serves small replies fine
++         * and corrupts the whole control path on the first larger write.
++         * Count it and keep it OUT of the pool instead. */
++        data = (A_UINT8 *)adf_os_mem_alloc(nSize);
++        if (data == NULL) {
++            custom_pool_memfail++;
++            VBUF_free_vbuf(buf);
++            continue;   /* desc leaks once per failure - boot only, harmless */
++        }
++
++        desc->buf_addr = data;
+         desc->buf_size = nSize;
+         desc->data_offset = 0;
+         desc->data_size = 0;
+diff --git a/target_firmware/magpie_fw_dev/target/htc/htc.c b/target_firmware/magpie_fw_dev/target/htc/htc.c
+index a9a9a20..4886e6e 100755
+--- a/target_firmware/magpie_fw_dev/target/htc/htc.c
++++ b/target_firmware/magpie_fw_dev/target/htc/htc.c
+@@ -44,6 +44,7 @@
+ #include <htc.h>
+ #include <htc_api.h>
+ #include <hif_api.h>
++#include <hif_usb.h>   /* CUSTOM BUILD v4-fix: HIF_USB_PIPE_INTERRUPT for the EP3 packet cap */
+ #include <adf_os_mem.h>
+ #include <adf_os_io.h>
+ 
+@@ -51,6 +52,11 @@
+ 
+ #define A_UNCACHED_ADDR(addr) addr
+ 
++/* CUSTOM BUILD v4-fix: packets armed on the EP3 IN pipe (HIF_USB_PIPE_INTERRUPT)
++ * must stay strictly below the 64B USB max-packet boundary - a 64B packet jams
++ * the USB controller after transmission (see _HTC_SendMsg trailer cap). */
++#define HTC_EP3_SAFE_PACKET 60
++
+ /* prototypes */
+ LOCAL void HTCControlSvcProcessMsg(HTC_ENDPOINT_ID EndpointID, adf_nbuf_t hdr_buf, adf_nbuf_t pBuffers, void *arg);
+ LOCAL void HTCControlSvcProcessSendComplete(HTC_ENDPOINT_ID EndpointID, adf_nbuf_t pBuffers, void *arg);
+@@ -314,6 +320,26 @@ LOCAL void _HTC_SendMsg(htc_handle_t htcHandle, HTC_ENDPOINT_ID EndpointID,
+ 		}
+ 
+ 		room = adf_os_min( adf_nbuf_tailroom(pBuffers), roomForPipeMaxLen);
++
++		/* CUSTOM BUILD v4-fix (WMI wedge root cause): a control packet
++		 * armed at the EP3 max packet size (64B) wedges the USB
++		 * controller - usbmon shows the rssi_hist reply (48B bins + 4B
++		 * WMI hdr + 4B credit trailer + 8B HTC hdr = 64B) transmitting
++		 * fine and the device dying right after: EP3 IN then babbles
++		 * EOVERFLOW once per poll and EP4 OUT stops ACKing, so every
++		 * WMI command times out until the device re-enumerates
++		 * (firmware reboot). Cap the opportunistic credit-report
++		 * trailer so control-pipe packets stay strictly under the
++		 * 64B boundary; pending credits are reported later on the
++		 * next outgoing packet instead. */
++		if (pHTC->Endpoints[EndpointID].DownLinkPipeID == HIF_USB_PIPE_INTERRUPT) {
++			int roomCap = (int)HTC_EP3_SAFE_PACKET - (int)adf_nbuf_len(pBuffers);
++			if (room > roomCap)
++				room = roomCap;
++			if (room < 0)
++				room = 0;
++		}
++
+ 		if (room < (int)(sizeof(HTC_CREDIT_REPORT) + sizeof(HTC_RECORD_HDR))) {
+ 			/* no room for any reports */
+ 			break;
+diff --git a/target_firmware/magpie_fw_dev/target/wmi/wmi_svc.c b/target_firmware/magpie_fw_dev/target/wmi/wmi_svc.c
+index b68dcfc..cd5d0ef 100755
+--- a/target_firmware/magpie_fw_dev/target/wmi/wmi_svc.c
++++ b/target_firmware/magpie_fw_dev/target/wmi/wmi_svc.c
+@@ -49,6 +49,17 @@
+ 
+ #include "wmi_internal.h"
+ 
++/* CUSTOM BUILD v3-diag: target-side control-path health counters, exported
++ * through the custom ping reply (handle_custom_ping_cmd in if_ath.c).
++ * rx_cmds    - every command buffer received on the CTL endpoint;
++ * send_dones - every WMI buffer returned by the HTC send-complete path.
++ * If replies die but rx_cmds keeps growing, the target still hears the
++ * host (its sends are fine) and the loss is on the reply leg; if
++ * send_dones never advances past the replies actually observed, the
++ * send-complete recycle is the wedge. */
++A_UINT32 custom_wmi_rx_cmds = 0;
++A_UINT32 custom_wmi_send_dones = 0;
++
+ static void WMIRecvMessageHandler(HTC_ENDPOINT_ID EndPt, adf_nbuf_t hdr_buf,
+ 				  adf_nbuf_t pHTCBuf, void *arg)
+ {
+@@ -82,6 +93,7 @@ static void WMIRecvMessageHandler(HTC_ENDPOINT_ID EndPt, adf_nbuf_t hdr_buf,
+ 		cmdHdr = (WMI_CMD_HDR *)anbdata;
+ 		cmd = adf_os_ntohs(cmdHdr->commandId);
+ 		seq = adf_os_ntohs(cmdHdr->seqNo);
++		custom_wmi_rx_cmds++;   /* CUSTOM BUILD v3-diag */
+ 
+ 		pCmdBuffer = anbdata + sizeof(WMI_CMD_HDR);
+ 		pCmdHandler = NULL;
+@@ -144,6 +156,8 @@ static void _WMI_SendCompleteHandler(HTC_ENDPOINT_ID Endpt, adf_nbuf_t pHTCBuf,
+ 	WMI_BUF_CONTEXT *ctx;
+ 	BUF_POOL_ID poolId;
+ 
++	custom_wmi_send_dones++;   /* CUSTOM BUILD v3-diag */
++
+ 	ctx = (WMI_BUF_CONTEXT *)adf_nbuf_get_priv(pHTCBuf);
+ 
+ 	if ( ctx->EventClass == WMI_EVT_CLASS_CMD_EVENT ) {
+diff --git a/target_firmware/magpie_fw_dev/target/wmi/wmi_svc_api.h b/target_firmware/magpie_fw_dev/target/wmi/wmi_svc_api.h
+index c6cb0db..d87da12 100755
+--- a/target_firmware/magpie_fw_dev/target/wmi/wmi_svc_api.h
++++ b/target_firmware/magpie_fw_dev/target/wmi/wmi_svc_api.h
+@@ -45,6 +45,10 @@
+ #include <adf_nbuf.h>
+ #include <buf_pool_api.h>
+ 
++/* CUSTOM BUILD v3-note: DO NOT raise this budget! A 200-byte attempt
++ * exhausted the target heap at pool-creation time (boot) and killed the
++ * WMI layer entirely. The real fix for the boundary issue was COMPACTING
++ * the custom replies to <= 64 bytes (see if_ath.c rate_usage/rssi_hist). */
+ #define WMI_SVC_MAX_BUFFERED_EVENT_SIZE 100
+ #define WMI_SVC_MSG_SIZE                1536    /* maximum size of any WMI control or event message */
+ 
+diff --git a/target_firmware/wlan/if_ath.c b/target_firmware/wlan/if_ath.c
+index f8dee47..16534d8 100755
+--- a/target_firmware/wlan/if_ath.c
++++ b/target_firmware/wlan/if_ath.c
+@@ -159,12 +159,17 @@ static void ath_setcurmode(struct ath_softc_tgt *sc,
+ 
+ }
+ 
++/* CUSTOM BUILD v3-diag: total target->host events sent (SWBA/BMISS/...) */
++A_UINT32 custom_evt_entries = 0;
++
+ void wmi_event(wmi_handle_t handle, WMI_EVENT_ID evt_id,
+ 	       void *buffer, a_int32_t Length)
+ {
+ 	adf_nbuf_t netbuf = ADF_NBUF_NULL;
+ 	a_uint8_t *pData;
+ 
++	custom_evt_entries++;   /* CUSTOM BUILD v3-diag */
++
+ 	netbuf = WMI_AllocEvent(handle, WMI_EVT_CLASS_CMD_EVENT,
+ 				sizeof(WMI_CMD_HDR) + Length);
+ 
+@@ -181,22 +186,57 @@ void wmi_event(wmi_handle_t handle, WMI_EVENT_ID evt_id,
+ 	WMI_SendEvent(handle, netbuf, evt_id, 0, Length);
+ }
+ 
++/* CUSTOM BUILD v3-diag: reply-path health counters, exported through the
++ * custom ping reply. rsp_entries counts every wmi_cmd_rsp attempt,
++ * rsp_allocfail counts WMI_AllocEvent failures (pool exhaustion). */
++A_UINT32 custom_rsp_entries = 0;
++A_UINT32 custom_rsp_allocfail = 0;
++extern A_UINT32 custom_wmi_rx_cmds;
++extern A_UINT32 custom_wmi_send_dones;
++extern A_UINT32 custom_pool_memfail;
++
+ void wmi_cmd_rsp(void *pContext, WMI_COMMAND_ID cmd_id, A_UINT16 SeqNo,
+ 		 void *buffer, a_int32_t Length)
+ {
+ 	adf_nbuf_t netbuf = ADF_NBUF_NULL;
+ 	A_UINT8 *pData;
+ 
+-	netbuf = WMI_AllocEvent(pContext, WMI_EVT_CLASS_CMD_REPLY,
++	custom_rsp_entries++;   /* CUSTOM BUILD v3-diag */
++
++	/* CUSTOM BUILD v3-fix: replies now allocate from the EVENT pool
++	 * (8 buffers) instead of the CMD_REPLY pool (2 buffers). The pool
++	 * class never crosses the wire - the host matches replies by
++	 * cmd_id+seq regardless - but the event pool demonstrably recycles
++	 * under sustained control traffic (SWBA/txstatus flow through it in
++	 * stock operation), while the 2-deep reply pool gave us exactly two
++	 * working replies per fw load before the control path died. */
++	netbuf = WMI_AllocEvent(pContext, WMI_EVT_CLASS_CMD_EVENT,
+ 				sizeof(WMI_CMD_HDR) + Length);
+ 
+ 	if (netbuf == ADF_NBUF_NULL) {
+-		adf_os_assert(0);
++		/* CUSTOM BUILD v3-fix: reply-pool exhaustion under connected
++		 * traffic used to adf_os_assert(0) here = instant target halt.
++		 * Fail gracefully instead: the host sees a command timeout and
++		 * retries, the target stays alive. */
++		custom_rsp_allocfail++;   /* CUSTOM BUILD v3-diag */
++		adf_os_print("wmi_cmd_rsp: reply pool exhausted, dropping\n");
++		return;
++	}
++	if (Length >= WMI_SVC_MAX_BUFFERED_EVENT_SIZE) {
++		/* CUSTOM BUILD v3-fix: oversized reply would corrupt the pool
++		 * buffer - drop instead (same guard as wmi_event). */
++		adf_os_print("wmi_cmd_rsp: reply too large (%d), dropping\n", Length);
+ 		return;
+ 	}
+ 
+ 	if (Length != 0 && buffer != NULL) {
+ 		pData = (A_UINT8 *)adf_nbuf_put_tail(netbuf, Length);
++		if (pData == NULL) {
++			/* CUSTOM BUILD v3-fix: never memcpy to a failed tail */
++			adf_os_print("wmi_cmd_rsp: put_tail failed, dropping\n");
++			adf_nbuf_free(netbuf);
++			return;
++		}
+ 		adf_os_mem_copy(pData, buffer, Length);
+ 	}
+ 
+@@ -475,6 +515,460 @@ static a_int32_t ath_startrecv(struct ath_softc_tgt *sc)
+ 	return 0;
+ }
+ 
++/* ==================================================================== */
++/* CUSTOM BUILD v2: firmware-resident extensions                        */
++/*  - periodic tick driven by the RX path (beacons/traffic) and SWBA    */
++/*  - target->host telemetry event (WMI_CUSTOM_TELEMETRY_EVENTID)       */
++/*  - firmware-side adaptive ANI (firstep stepping on PHY error rate)   */
++/*  - RSSI histogram                                                    */
++/*  - radio-level MAC filter (applied before USB upload)                */
++/*  - watchdog: wedged beacon queue -> WMI_FATAL -> host resets us      */
++/* ==================================================================== */
++
++#include <adf_os_io.h>   /* CUSTOM BUILD v2: ioread32_mac/iowrite32_mac */
++
++#define CUSTOM_TICK_MS           2000
++#define CUSTOM_RATE_USAGE_MAX    32
++#define CUSTOM_RSSI_BINS         64
++#define CUSTOM_MACFILTER_MAX     8
++
++/* per-rate TX usage: incremented in rcRateSetseries() (ratectrl_11n_ln.c) */
++extern a_uint32_t custom_rate_usage[CUSTOM_RATE_USAGE_MAX];
++
++static a_uint32_t custom_tick_last_ms = 0;
++static a_uint32_t custom_uptime_ticks = 0;
++static a_uint32_t custom_tlm_seq = 0;
++
++static a_uint32_t custom_rx_frames_total = 0;
++static a_uint32_t custom_rx_frames_window = 0;
++static a_uint32_t custom_phy_errs_total = 0;
++static a_uint32_t custom_phy_errs_window = 0;
++
++static a_uint8_t  custom_rssi_hist[CUSTOM_RSSI_BINS];
++static a_uint32_t custom_rssi_total = 0;
++static a_uint32_t custom_rssi_win_sum = 0;   /* v4: per-tick average source */
++
++static a_uint8_t  custom_ani_auto = 0;    /* 0 = host-manual, 1 = fw adaptive */
++static a_uint32_t custom_ani_level = 0;   /* current firstep level 0..2 */
++
++static a_uint8_t  custom_mf_mode = 0;     /* 0 = off, 1 = allow, 2 = block */
++static a_uint8_t  custom_mf_mac[CUSTOM_MACFILTER_MAX][6];
++static a_uint8_t  custom_mf_count = 0;
++
++static a_uint32_t custom_wd_strikes = 0;
++static a_uint32_t custom_wd_last_pending = 0xFFFFFFFF;
++
++/* ---- CUSTOM BUILD v3 ---- */
++static a_uint32_t custom_rc_num_tries = 0;   /* 0 = fw default (10); if_owl.c */
++static a_uint32_t custom_rc_num_rates = 0;   /* 0 = fw default (4); if_owl.c */
++static a_uint32_t custom_baw_size = 0;       /* 0 = WME_MAX_BA default; if_owl.c */
++
++static a_uint32_t custom_mf_dropped = 0;
++static a_uint32_t custom_beacons_window = 0;
++
++/* mini-NetFlow: per-MAC accounting (4 entries, u16 saturated) */
++static a_uint8_t  custom_nfl_mac[4][6];
++static a_uint16_t custom_nfl_frames[4];
++static a_uint16_t custom_nfl_bytes[4];
++static a_uint8_t  custom_nfl_count = 0;
++static a_uint8_t  custom_nfl_next = 0;
++
++/* per-channel NF survey (12 entries) */
++static a_uint16_t custom_fs_freq[12];
++static a_int16_t  custom_fs_nf[12];
++static a_uint8_t  custom_fs_count = 0;
++static a_uint8_t  custom_fs_rr = 0;
++
++/* auto-spectral */
++static a_uint8_t  custom_spec_auto = 0;
++static a_uint32_t custom_spec_threshold = 300;
++static a_uint8_t  custom_spec_active = 0;
++static a_uint8_t  custom_spec_ticks = 0;
++
++/* auto-ANI v2: CCA threshold offset */
++static a_uint8_t  custom_cca_base = 0;
++static a_int32_t  custom_cca_offset = 0;
++
++/* black-box ring buffer: type<<24 | data&0xFFFFFF */
++static a_uint32_t custom_bb[16];
++static a_uint8_t  custom_bb_head = 0;
++static a_uint8_t  custom_bb_count = 0;
++
++static void custom_log_bb(a_uint8_t type, a_uint32_t data)
++{
++	custom_bb[custom_bb_head] = ((a_uint32_t)type << 24) | (data & 0x00FFFFFF);
++	custom_bb_head = (custom_bb_head + 1) % 16;
++	if (custom_bb_count < 16)
++		custom_bb_count++;
++}
++
++/* AR9002 registers not present in ar5416reg.h (literals, see ar9002_phy.h) */
++#define CUSTOM_REG_FIND_SIG         0x9858
++#define CUSTOM_FIND_SIG_FIRSTEP_M   0x0003F000
++#define CUSTOM_FIND_SIG_FIRSTEP_S   12
++#define CUSTOM_REG_FIND_SIG_LOW     0x9840
++#define CUSTOM_FIND_SIG_LOW_M       0x00000FC0
++#define CUSTOM_FIND_SIG_LOW_S       6
++#define CUSTOM_REG_CCA              0x9864
++#define CUSTOM_MINCCA_M             0x0FF80000
++#define CUSTOM_MINCCA_S             19
++
++static a_int32_t custom_read_nf(struct ath_softc_tgt *sc)
++{
++	a_uint32_t v = (ioread32_mac(CUSTOM_REG_CCA) & CUSTOM_MINCCA_M) >> CUSTOM_MINCCA_S;
++	a_int32_t nf = (a_int32_t)v;
++
++	(void)sc;
++	if (nf & 0x100)
++		nf -= 0x200;
++	return nf;
++}
++
++static void custom_ani_write_level(struct ath_softc_tgt *sc, a_uint32_t level)
++{
++	a_uint32_t value = level * 2;
++	a_uint32_t v;
++
++	(void)sc;
++	v = ioread32_mac(CUSTOM_REG_FIND_SIG);
++	v = (v & ~CUSTOM_FIND_SIG_FIRSTEP_M) | (value << CUSTOM_FIND_SIG_FIRSTEP_S);
++	iowrite32_mac(CUSTOM_REG_FIND_SIG, v);
++
++	v = ioread32_mac(CUSTOM_REG_FIND_SIG_LOW);
++	v = (v & ~CUSTOM_FIND_SIG_LOW_M) | (value << CUSTOM_FIND_SIG_LOW_S);
++	iowrite32_mac(CUSTOM_REG_FIND_SIG_LOW, v);
++}
++
++static a_bool_t custom_mac_in_table(a_uint8_t *addr)
++{
++	a_uint8_t i, j;
++
++	for (i = 0; i < custom_mf_count; i++) {
++		for (j = 0; j < 6; j++)
++			if (custom_mf_mac[i][j] != addr[j])
++				break;
++		if (j == 6)
++			return TRUE;   /* matched (all-zero entries never match) */
++	}
++	return FALSE;
++}
++
++/* returns TRUE when this frame must NOT be uploaded to the host */
++static a_bool_t custom_rx_filter_frame(struct ieee80211_frame *wh)
++{
++	a_bool_t hit;
++
++	if (custom_mf_mode == 0 || custom_mf_count == 0)
++		return FALSE;
++
++	hit = custom_mac_in_table(wh->i_addr1) || custom_mac_in_table(wh->i_addr2);
++
++	if (custom_mf_mode == 1)
++		return !hit;    /* allow-list: drop everything not in the table */
++	return hit;         /* block-list: drop matching frames */
++}
++
++static a_int8_t custom_nfl_find(a_uint8_t *addr)
++{
++	a_uint8_t i, j;
++
++	for (i = 0; i < custom_nfl_count; i++) {
++		for (j = 0; j < 6; j++)
++			if (custom_nfl_mac[i][j] != addr[j])
++				break;
++		if (j == 6)
++			return (a_int8_t)i;
++	}
++	return -1;
++}
++
++static a_int8_t custom_nfl_insert(a_uint8_t *addr)
++{
++	a_int8_t slot;
++	a_uint8_t j;
++
++	if (custom_nfl_count < 4) {
++		slot = (a_int8_t)custom_nfl_count++;
++	} else {
++		slot = (a_int8_t)custom_nfl_next;
++		custom_nfl_next = (custom_nfl_next + 1) % 4;
++	}
++	for (j = 0; j < 6; j++)
++		custom_nfl_mac[slot][j] = addr[j];
++	custom_nfl_frames[slot] = 0;
++	custom_nfl_bytes[slot] = 0;
++	return slot;
++}
++
++/* CUSTOM BUILD v3-isolation: master switch for the custom RX-path hooks
++ * (RSSI histogram, beacon counter, mini-NetFlow, MAC-filter verdict and the
++ * RX-driven chores tick). 0 = all OFF: the RX tasklet runs stock code only.
++ * Used to bisect the random control-path wedge: if the wedge disappears with
++ * the hooks off, the bug lives here; if it persists, it lives in the custom
++ * WMI handlers / channel-note path.
++ * CUSTOM BUILD v4: briefly shipped as 1 (telemetry drain looked root-caused),
++ * but the first hardware run reproduced the wedge signature (custom replies
++ * die after ~2 replies, docs/12 section 5) - so the documented stable
++ * baseline (0) is restored until the wedge is bisected for real. The
++ * thermal WMI command flips this switch at runtime
++ * (CUSTOM_TH_FLAG_HOOKS_ON/OFF) for bisecting without a rebuild. */
++static a_uint32_t custom_rx_hooks = 0;
++
++/* ---- CUSTOM BUILD v4: thermal governor ------------------------------- */
++/* The AR9271 has no readable die-temperature register, so the governor
++ * manages the dominant heat sources directly:
++ *  - PA output power: the per-frame descriptor XmitPower (if_owl.c) is
++ *    capped by link quality (RSSI-aware, with hysteresis) and by an
++ *    optional static cap;
++ *  - TX duty (optional mode bit): sustained transmission backs the power
++ *    off further, recovering slowly when the air goes quiet.
++ * All decisions run inside custom_periodic_chores (2s, RX-driven); no
++ * periodic WMI traffic is generated (docs/10 golden rule #4). */
++#define CUSTOM_TH_MODE_RSSI_CAP  0x1
++#define CUSTOM_TH_MODE_DUTY_BKOF 0x2
++
++#define CUSTOM_TH_RSSI_HI        45   /* window avg >= this: strong link   */
++#define CUSTOM_TH_RSSI_LO        35   /* window avg <  this: weak link     */
++#define CUSTOM_TH_CAP_STRONG     48   /* cap on a strong link (-12 idx)    */
++#define CUSTOM_TH_CAP_WEAK       60   /* cap on a weak link (stock power)  */
++#define CUSTOM_TH_TX_BUSY        1500 /* TX usage delta per 2s tick        */
++#define CUSTOM_TH_TX_IDLE        100
++#define CUSTOM_TH_BACKOFF_MAX    16   /* power steps of dynamic backoff    */
++#define CUSTOM_TH_POWER_FLOOR    20   /* never below this index            */
++
++static a_uint8_t  custom_th_mode = CUSTOM_TH_MODE_RSSI_CAP; /* duty off by default */
++static a_uint8_t  custom_tx_cap = 0xFF;          /* static cap, 0xFF = uncapped */
++static a_uint8_t  custom_th_backoff = 0;         /* dynamic backoff steps       */
++static a_uint8_t  custom_th_decided_cap = 60;    /* RSSI-hysteresis decision    */
++static a_uint32_t custom_th_tx_last = 0;         /* rate_usage snapshot         */
++static a_uint32_t custom_th_tx_window = 0;       /* last tick's TX delta        */
++static a_uint32_t custom_th_rx_window = 0;       /* last tick's RX frames       */
++static a_int32_t  custom_th_avg_rssi = 0;        /* last tick's average RSSI    */
++
++extern a_uint8_t custom_tx_power;   /* defined below in this file */
++
++/* single knob used for every data-frame TX descriptor (if_owl.c) */
++a_uint8_t custom_tx_power_effective(void)
++{
++	a_int32_t p = custom_tx_power;
++
++	if (custom_tx_cap < p)
++		p = custom_tx_cap;
++	if (custom_th_decided_cap < p)
++		p = custom_th_decided_cap;
++	p -= custom_th_backoff;
++	if (p < CUSTOM_TH_POWER_FLOOR)
++		p = CUSTOM_TH_POWER_FLOOR;
++	return (a_uint8_t)p;
++}
++
++/* per-frame hook: stats, RSSI histogram, MAC filter verdict */
++static a_bool_t custom_rx_frame_process(struct ath_softc_tgt *sc,
++					struct ath_rx_status *rxstats,
++					struct ieee80211_frame *wh)
++{
++	a_int32_t rssi;
++
++	if (!custom_rx_hooks)
++		return FALSE;   /* isolation: stock RX path only */
++
++	(void)sc;
++	custom_rx_frames_total++;
++	custom_rx_frames_window++;
++
++	if (rxstats->rs_phyerr) {
++		custom_phy_errs_total++;
++		custom_phy_errs_window++;
++	}
++
++	rssi = rxstats->rs_rssi_combined;
++	if (rssi < 0)
++		rssi = 0;
++	if (rssi > (CUSTOM_RSSI_BINS - 1))
++		rssi = CUSTOM_RSSI_BINS - 1;
++	if (custom_rssi_hist[rssi] != 0xFFFF)
++		custom_rssi_hist[rssi]++;
++	custom_rssi_total++;
++	custom_rssi_win_sum += rssi;   /* v4: thermal governor input */
++
++	/* v3: beacon counter */
++	if ((wh->i_fc[0] & 0x0c) == 0 && (wh->i_fc[0] & 0xf0) == 0x80) {
++		custom_beacons_window++;
++	}
++
++	/* v3: mini-NetFlow accounting */
++	{
++		a_int8_t slot = custom_nfl_find(wh->i_addr1);
++		if (slot < 0)
++			slot = custom_nfl_find(wh->i_addr2);
++		if (slot < 0)
++			slot = custom_nfl_insert(wh->i_addr1);
++		if (slot >= 0) {
++			a_uint32_t blen = rxstats->rs_datalen;
++			a_uint32_t nb = custom_nfl_bytes[slot] + blen;
++
++			if (custom_nfl_frames[slot] != 0xFFFF)
++				custom_nfl_frames[slot]++;
++			custom_nfl_bytes[slot] = (nb > 0xFFFF) ? 0xFFFF : nb;
++		}
++	}
++
++	return custom_rx_filter_frame(wh);
++}
++
++/* periodic chores, rate-limited by CUSTOM_TICK_MS; driven by the RX path
++ * (beacons of the associated AP keep this alive when idle) and SWBA (AP). */
++static void custom_periodic_chores(struct ath_softc_tgt *sc, a_bool_t from_swba)
++{
++	struct ath_hal *ah = sc->sc_ah;
++	WMI_CUSTOM_TELEMETRY_EVT evt;
++	a_uint32_t now = A_MS_TICKGET();
++
++	if (now - custom_tick_last_ms < CUSTOM_TICK_MS)
++		return;
++	custom_tick_last_ms = now;
++	custom_uptime_ticks++;
++
++	/* 1) firmware-side adaptive ANI (v3: firstep + CCA threshold offset) */
++	if (custom_ani_auto && custom_rx_frames_window > 50) {
++		a_uint32_t rate = custom_phy_errs_window * 1000 / custom_rx_frames_window;
++		a_uint8_t stepped = 0;
++
++		if (rate > 200 && custom_ani_level < 2) {
++			custom_ani_level++;
++			custom_ani_write_level(sc, custom_ani_level);
++			stepped = 1;
++		} else if (rate < 20 && custom_ani_level > 0) {
++			custom_ani_level--;
++			custom_ani_write_level(sc, custom_ani_level);
++			stepped = 1;
++		}
++
++		if (stepped) {
++			a_uint32_t reg = ioread32_mac(0x9864);
++			a_uint8_t byte;
++
++			custom_log_bb(1, custom_ani_level);
++			if (rate > 200 && custom_cca_offset < 12) {
++				custom_cca_offset += 3;
++				byte = (a_uint8_t)(custom_cca_base + custom_cca_offset);
++				reg = (reg & ~0x000000FF) | byte;
++				iowrite32_mac(0x9864, reg);
++			} else if (rate < 20 && custom_cca_offset > 0) {
++				custom_cca_offset -= 3;
++				byte = (a_uint8_t)(custom_cca_base + custom_cca_offset);
++				reg = (reg & ~0x000000FF) | byte;
++				iowrite32_mac(0x9864, reg);
++			}
++		}
++	}
++
++	/* 1b) v3: auto-spectral burst on PHY-error spikes */
++	if (custom_spec_auto && !custom_spec_active &&
++	    custom_rx_frames_window > 50) {
++		a_uint32_t rate = custom_phy_errs_window * 1000 / custom_rx_frames_window;
++		a_uint32_t reg = ioread32_mac(0x9910);
++
++		if (rate > custom_spec_threshold) {
++			iowrite32_mac(0x9910, reg | 0x00000003);   /* ENA|ACTIVE */
++			custom_spec_active = 1;
++			custom_spec_ticks = 3;
++			custom_log_bb(4, rate);
++		}
++	} else if (custom_spec_active) {
++		a_uint32_t reg = ioread32_mac(0x9910);
++
++		if (--custom_spec_ticks == 0) {
++			iowrite32_mac(0x9910, reg & ~0x00000003);
++			custom_spec_active = 0;
++		}
++	}
++
++	/* 2) watchdog: wedged beacon queue (AP mode) -> self-reset request */
++	if (from_swba) {
++		a_uint32_t pending = ah->ah_numTxPending(ah, sc->sc_bhalq);
++
++		if (pending > 0 && pending >= custom_wd_last_pending) {
++			if (++custom_wd_strikes >= 3) {
++				/* CUSTOM BUILD v3-fix: this used to fire
++				 * WMI_FATAL_EVENTID (self-reset request) from the
++				 * SWBA context. In station mode sc_bhalq is not a
++				 * configured queue and ah_numTxPending can read
++				 * stale garbage, striking a host reset while the
++				 * host is mid-command - the control path then
++				 * wedges permanently. Strikes are still counted
++				 * and recorded in the black box for post-mortem,
++				 * but the reset request is gone. */
++				custom_log_bb(2, custom_wd_strikes);
++				custom_wd_strikes = 0;
++			}
++		} else {
++			custom_wd_strikes = 0;
++		}
++		custom_wd_last_pending = pending;
++	}
++
++	/* 2b) CUSTOM BUILD v4: thermal governor (PA heat = output power x duty) */
++	{
++		a_uint32_t txd = 0, i;
++
++		for (i = 0; i < CUSTOM_RATE_USAGE_MAX; i++)
++			txd += custom_rate_usage[i];
++		if (txd > custom_th_tx_last)
++			txd -= custom_th_tx_last;
++		else
++			txd = 0;   /* counters wrapped or were reset */
++		custom_th_tx_last += txd;
++		custom_th_tx_window = txd;
++		custom_th_rx_window = custom_rx_frames_window;
++
++		if (custom_rx_frames_window) {
++			custom_th_avg_rssi = (a_int32_t)
++			    (custom_rssi_win_sum / custom_rx_frames_window);
++			custom_rssi_win_sum = 0;
++		}
++
++		if (custom_th_mode & CUSTOM_TH_MODE_RSSI_CAP) {
++			a_uint8_t cap;
++
++			if (custom_th_avg_rssi >= CUSTOM_TH_RSSI_HI)
++				cap = CUSTOM_TH_CAP_STRONG;
++			else if (custom_th_avg_rssi < CUSTOM_TH_RSSI_LO)
++				cap = CUSTOM_TH_CAP_WEAK;
++			else
++				cap = custom_th_decided_cap;  /* hysteresis band */
++
++			if (custom_tx_cap < cap)
++				cap = custom_tx_cap;  /* static cap always wins */
++			if (cap != custom_th_decided_cap) {
++				custom_th_decided_cap = cap;
++				custom_log_bb(5, ((a_uint32_t)custom_th_backoff << 8) | cap);
++			}
++		} else if (custom_th_decided_cap != 0xFF) {
++			custom_th_decided_cap = 0xFF;
++			custom_log_bb(5, 0xFF);
++		}
++
++		if (custom_th_mode & CUSTOM_TH_MODE_DUTY_BKOF) {
++			if (txd > CUSTOM_TH_TX_BUSY &&
++			    custom_th_backoff < CUSTOM_TH_BACKOFF_MAX)
++				custom_th_backoff += 2;
++			else if (txd < CUSTOM_TH_TX_IDLE && custom_th_backoff > 0)
++				custom_th_backoff--;
++		} else if (custom_th_backoff) {
++			custom_th_backoff = 0;
++		}
++	}
++
++	/* 3) TELEMETRY EVENT WITHDRAWN (recovery fix): the periodic event drained
++	 * the HTC control-endpoint credits while associated (~1400 events froze
++	 * the ctl path: command replies died with it). The window counters are
++	 * still maintained; telemetry returns later via a credit-safe design. */
++	(void)evt;
++	custom_rx_frames_window = 0;
++	custom_phy_errs_window = 0;
++}
++
+ static void ath_tgt_rx_tasklet(TQUEUE_ARG data)
+ {
+ 	struct ath_softc_tgt *sc  = (struct ath_softc_tgt *)data;
+@@ -484,6 +978,10 @@ static void ath_tgt_rx_tasklet(TQUEUE_ARG data)
+ 	struct ath_rx_status *rxstats;
+ 	adf_nbuf_t skb = ADF_NBUF_NULL;
+ 
++	/* CUSTOM BUILD v2: periodic chores tick (beacons/traffic driven) */
++	if (custom_rx_hooks)
++		custom_periodic_chores(sc, FALSE);
++
+ 	do {
+ 		bf = asf_tailq_first(&sc->sc_rxbuf);
+ 		if (bf == NULL) {
+@@ -511,6 +1009,31 @@ static void ath_tgt_rx_tasklet(TQUEUE_ARG data)
+ 
+ 		rxstats->rs_tstamp = ath_extend_tsf(sc, (u_int32_t)rxstats->rs_tstamp);
+ 
++		/* CUSTOM BUILD v2: stats + RSSI histogram + radio-level MAC filter */
++		{
++			a_uint8_t *ndata = NULL;
++			a_uint32_t nlen = 0;
++			struct ieee80211_frame *wh;
++
++			adf_nbuf_peek_header(skb, &ndata, &nlen);
++			wh = (struct ieee80211_frame *)
++				(ndata + sizeof(struct rx_frame_header));
++
++			if (nlen < sizeof(struct rx_frame_header) +
++				   sizeof(struct ieee80211_frame)) {
++				/* too short to hold a wireless header: skip the
++				 * custom processing, upload as-is */
++			} else if (custom_rx_frame_process(sc, rxstats, wh)) {
++				/* dropped by the radio-level filter: recycle the
++				 * buffer back to the WLAN RX pool */
++				custom_mf_dropped++;
++				adf_nbuf_free(skb);
++				bf->bf_status &= ~ATH_BUFSTATUS_DONE;
++				asf_tailq_insert_tail(&sc->sc_rxbuf, bf, bf_list);
++				continue;
++			}
++		}
++
+ 		HTC_SendMsg(sc->tgt_htc_handle, RX_ENDPOINT_ID, skb);
+ 		sc->sc_rx_stats.ast_rx_send++;
+ 
+@@ -1036,6 +1559,17 @@ adf_os_irq_resp_t ath_intr(adf_drv_handle_t hdl)
+ 				  sizeof(WMI_SWBA_EVENT));
+ 
+ 			ath_tx_draintxq(sc, txq);
++
++			/* CUSTOM BUILD v3-fix: the periodic-chores call that used
++			 * to live here (beacon-queue watchdog) ran HAL calls from
++			 * the SWBA interrupt context. SWBA also fires in station
++			 * mode (~1 TBTT event/sec, visible as ~49 extra ctl sends
++			 * per boot in the ping diag), so a HAL call here raced the
++			 * WMI command handlers mid-register-access and wedged the
++			 * target's control path at random moments. The handler is
++			 * stock-only again; the chores keep running from the RX
++			 * tasklet below, which is memory-only while ANI and
++			 * auto-spectral are off. */
+ 		}
+ 
+ 		if (status & HAL_INT_RXORN)
+@@ -1682,6 +2216,490 @@ static void handle_echo_command(void *pContext, A_UINT16 Command,
+ 	wmi_cmd_rsp(pContext, WMI_ECHO_CMDID, SeqNo, buffer, Length);
+ }
+ 
++/* CUSTOM BUILD: custom ping - echoes the host payload back together with a
++ * target-side counter, proving a full host->target->host WMI round trip. */
++static a_uint32_t custom_ping_counter = 0;
++
++static void handle_custom_ping_cmd(void *Context, A_UINT16 Command,
++				   A_UINT16 SeqNo, A_UINT8 *buffer,
++				   a_int32_t Length)
++{
++	struct ath_softc_tgt *sc = (struct ath_softc_tgt *)Context;
++	WMI_CUSTOM_PING_RSP rsp;
++	a_uint32_t payload = 0;
++
++	if (buffer && Length >= (a_int32_t)sizeof(WMI_CUSTOM_PING_CMD))
++		payload = adf_os_ntohl(((WMI_CUSTOM_PING_CMD *)buffer)->payload);
++
++	rsp.echo_payload = adf_os_htonl(payload);
++	rsp.pong_counter = adf_os_htonl(++custom_ping_counter);
++
++	/* CUSTOM BUILD v3-diag: live control-path counters piggyback on the
++	 * ping reply - the host can watch the target breathe without any
++	 * dedicated telemetry channel. */
++	rsp.diag_rx_cmds       = adf_os_htonl(custom_wmi_rx_cmds);
++	rsp.diag_send_dones    = adf_os_htonl(custom_wmi_send_dones);
++	rsp.diag_rsp_entries   = adf_os_htonl(custom_rsp_entries);
++	rsp.diag_rsp_allocfail = adf_os_htonl(custom_rsp_allocfail);
++	rsp.diag_pool_memfail  = adf_os_htonl(custom_pool_memfail);
++	rsp.diag_evt_entries   = adf_os_htonl(custom_evt_entries);
++
++	wmi_cmd_rsp(sc->tgt_wmi_handle, Command, SeqNo,
++		    (A_UINT8 *)&rsp, sizeof(rsp));
++}
++
++/* CUSTOM BUILD: runtime rate-control profile.
++ * custom_rc_step_dn_inc is consumed by ath_tgt_rate_findrate() (if_owl.c):
++ * 1 = clean-air profile (slower fallback), 2 = noisy-air profile (faster).
++ * custom_rc_fixed_rate: 0xFF = auto rate control, else fixed rate table index. */
++a_uint32_t custom_rc_step_dn_inc = 2;
++a_uint8_t  custom_rc_fixed_rate = 0xFF;
++
++static void handle_rc_profile_cmd(void *Context, A_UINT16 Command,
++				  A_UINT16 SeqNo, A_UINT8 *buffer,
++				  a_int32_t Length)
++{
++	struct ath_softc_tgt *sc = (struct ath_softc_tgt *)Context;
++	WMI_CUSTOM_RC_PROFILE_RSP rsp;
++
++	if (buffer && Length >= (a_int32_t)sizeof(WMI_CUSTOM_RC_PROFILE_CMD)) {
++		a_uint32_t val = adf_os_ntohl(((WMI_CUSTOM_RC_PROFILE_CMD *)buffer)->step_dn_inc);
++		a_uint32_t fr  = adf_os_ntohl(((WMI_CUSTOM_RC_PROFILE_CMD *)buffer)->fixed_rate_idx);
++		a_uint32_t nt  = adf_os_ntohl(((WMI_CUSTOM_RC_PROFILE_CMD *)buffer)->num_tries);
++		a_uint32_t nr  = adf_os_ntohl(((WMI_CUSTOM_RC_PROFILE_CMD *)buffer)->num_rates);
++
++		if (val != 0)
++			custom_rc_step_dn_inc = val;
++		if (fr <= 0x7F || fr == 0xFF)
++			custom_rc_fixed_rate = (a_uint8_t)fr;
++		if (nt >= 1 && nt <= 32)
++			custom_rc_num_tries = nt;
++		if (nr >= 1 && nr <= 4)
++			custom_rc_num_rates = nr;
++	}
++
++	rsp.step_dn_inc = adf_os_htonl(custom_rc_step_dn_inc);
++	rsp.fixed_rate_idx = adf_os_htonl(custom_rc_fixed_rate);
++	rsp.num_tries = adf_os_htonl(custom_rc_num_tries);
++	rsp.num_rates = adf_os_htonl(custom_rc_num_rates);
++	wmi_cmd_rsp(sc->tgt_wmi_handle, Command, SeqNo,
++		    (A_UINT8 *)&rsp, sizeof(rsp));
++}
++
++/* CUSTOM BUILD: per-frame TX power override. The stock firmware hardcodes 60
++ * (of 0..63) as the descriptor XmitPower for data frames (if_owl.c). */
++a_uint8_t custom_tx_power = 60;
++
++static void handle_txpower_cmd(void *Context, A_UINT16 Command,
++			       A_UINT16 SeqNo, A_UINT8 *buffer,
++			       a_int32_t Length)
++{
++	struct ath_softc_tgt *sc = (struct ath_softc_tgt *)Context;
++	WMI_CUSTOM_TXPOWER_RSP rsp;
++
++	if (buffer && Length >= (a_int32_t)sizeof(WMI_CUSTOM_TXPOWER_CMD)) {
++		a_uint32_t val = adf_os_ntohl(((WMI_CUSTOM_TXPOWER_CMD *)buffer)->tx_power);
++		if (val <= 0x3F)
++			custom_tx_power = (a_uint8_t)val;
++	}
++
++	rsp.tx_power = adf_os_htonl(custom_tx_power);
++	wmi_cmd_rsp(sc->tgt_wmi_handle, Command, SeqNo,
++		    (A_UINT8 *)&rsp, sizeof(rsp));
++}
++
++/* CUSTOM BUILD v4: thermal governor control. mode/cap = CUSTOM_TH_QUERY
++ * (0xFF) leaves the field untouched; flags can flip the RX-hook isolation
++ * switch at runtime (bisect tool, docs/10). Reply is 28B - well under the
++ * 64B reply budget. */
++static void handle_thermal_cmd(void *Context, A_UINT16 Command,
++			       A_UINT16 SeqNo, A_UINT8 *buffer,
++			       a_int32_t Length)
++{
++	struct ath_softc_tgt *sc = (struct ath_softc_tgt *)Context;
++	WMI_CUSTOM_THERMAL_RSP rsp;
++
++	if (buffer && Length >= (a_int32_t)sizeof(WMI_CUSTOM_THERMAL_CMD)) {
++		WMI_CUSTOM_THERMAL_CMD *cmd = (WMI_CUSTOM_THERMAL_CMD *)buffer;
++		a_uint32_t mode = adf_os_ntohl(cmd->mode);
++		a_uint32_t cap = adf_os_ntohl(cmd->cap);
++		a_uint32_t flags = adf_os_ntohl(cmd->flags);
++
++		if (mode != CUSTOM_TH_QUERY)
++			custom_th_mode = (a_uint8_t)(mode & 0x3);
++		/* v4-fix: cap 0xFF = uncapped (docs/12) - the old gate treated
++		 * 0xFF as the query marker for BOTH fields, making "cap 255"
++		 * (uncap) unreachable; the cap query marker is now 0x100. */
++		if (cap != CUSTOM_TH_CAP_QUERY)
++			custom_tx_cap = (a_uint8_t)((cap <= 0x3F) ? cap : 0xFF);
++		if (flags & CUSTOM_TH_FLAG_HOOKS_ON)
++			custom_rx_hooks = 1;
++		else if (flags & CUSTOM_TH_FLAG_HOOKS_OFF)
++			custom_rx_hooks = 0;
++	}
++
++	rsp.mode = adf_os_htonl(custom_th_mode);
++	rsp.cap = adf_os_htonl(custom_tx_cap);
++	rsp.backoff = adf_os_htonl(custom_th_backoff);
++	rsp.effective = adf_os_htonl(custom_tx_power_effective());
++	rsp.avg_rssi = adf_os_htonl((a_uint32_t)custom_th_avg_rssi);
++	rsp.tx_window = adf_os_htonl(custom_th_tx_window);
++	rsp.rx_window = adf_os_htonl(custom_th_rx_window);
++
++	wmi_cmd_rsp(sc->tgt_wmi_handle, Command, SeqNo,
++		    (A_UINT8 *)&rsp, sizeof(rsp));
++}
++
++/* CUSTOM BUILD v2: per-rate TX usage histogram (counted in rcRateSetseries) */
++static void handle_rate_usage_cmd(void *Context, A_UINT16 Command,
++				  A_UINT16 SeqNo, A_UINT8 *buffer,
++				  a_int32_t Length)
++{
++	struct ath_softc_tgt *sc = (struct ath_softc_tgt *)Context;
++	WMI_CUSTOM_RATE_USAGE_RSP rsp;
++	a_uint32_t i;
++	a_uint8_t do_reset = 0;
++
++	(void)Command;
++	if (buffer && Length >= (a_int32_t)sizeof(WMI_CUSTOM_RATE_USAGE_CMD))
++		do_reset = (adf_os_ntohl(((WMI_CUSTOM_RATE_USAGE_CMD *)buffer)->reset) == 1);
++
++	for (i = 0; i < WMI_CUSTOM_RATE_USAGE_MAX; i++) {
++		a_uint32_t c = custom_rate_usage[i];
++		rsp.usage[i] = (a_uint8_t)(c > 255 ? 255 : c);
++	}
++
++	if (do_reset)
++		adf_os_mem_set(custom_rate_usage, 0, sizeof(custom_rate_usage));
++
++	wmi_cmd_rsp(sc->tgt_wmi_handle, Command, SeqNo,
++		    (A_UINT8 *)&rsp, sizeof(rsp));
++}
++
++/* CUSTOM BUILD v2: firmware-side adaptive ANI control */
++static void handle_ani_auto_cmd(void *Context, A_UINT16 Command,
++				A_UINT16 SeqNo, A_UINT8 *buffer,
++				a_int32_t Length)
++{
++	struct ath_softc_tgt *sc = (struct ath_softc_tgt *)Context;
++	WMI_CUSTOM_ANI_AUTO_RSP rsp;
++
++	(void)Command;
++	if (buffer && Length >= (a_int32_t)sizeof(WMI_CUSTOM_ANI_AUTO_CMD)) {
++		a_uint32_t en = adf_os_ntohl(((WMI_CUSTOM_ANI_AUTO_CMD *)buffer)->enable);
++
++		if (en == 0 || en == 1) {
++			if (en == 0 && custom_ani_auto == 1) {
++				/* leaving auto mode: restore host-manual default */
++				custom_ani_level = 0;
++				custom_ani_write_level(sc, custom_ani_level);
++			}
++			custom_ani_auto = (a_uint8_t)en;
++		}
++	}
++
++	rsp.enable = adf_os_htonl(custom_ani_auto);
++	rsp.level = adf_os_htonl(custom_ani_level);
++	rsp.phy_errs = adf_os_htonl(custom_phy_errs_window);
++	wmi_cmd_rsp(sc->tgt_wmi_handle, Command, SeqNo,
++		    (A_UINT8 *)&rsp, sizeof(rsp));
++}
++
++/* CUSTOM BUILD v2: RSSI histogram query/reset */
++static void handle_rssi_hist_cmd(void *Context, A_UINT16 Command,
++				 A_UINT16 SeqNo, A_UINT8 *buffer,
++				 a_int32_t Length)
++{
++	struct ath_softc_tgt *sc = (struct ath_softc_tgt *)Context;
++	WMI_CUSTOM_RSSI_HIST_RSP rsp;
++	a_uint32_t i;
++	a_uint8_t do_reset = 0;
++
++	(void)Command;
++	if (buffer && Length >= (a_int32_t)sizeof(WMI_CUSTOM_RSSI_HIST_CMD))
++		do_reset = (adf_os_ntohl(((WMI_CUSTOM_RSSI_HIST_CMD *)buffer)->reset) == 1);
++
++	for (i = 0; i < WMI_CUSTOM_RSSI_HIST_BINS; i++)
++		rsp.bins[i] = custom_rssi_hist[i];
++
++	if (do_reset) {
++		adf_os_mem_set(custom_rssi_hist, 0, sizeof(custom_rssi_hist));
++		custom_rssi_total = 0;
++	}
++
++	wmi_cmd_rsp(sc->tgt_wmi_handle, Command, SeqNo,
++		    (A_UINT8 *)&rsp, sizeof(rsp));
++}
++
++/* CUSTOM BUILD v2: radio-level MAC filter configuration */
++static void handle_macfilter_cmd(void *Context, A_UINT16 Command,
++				 A_UINT16 SeqNo, A_UINT8 *buffer,
++				 a_int32_t Length)
++{
++	struct ath_softc_tgt *sc = (struct ath_softc_tgt *)Context;
++	WMI_CUSTOM_MACFILTER_RSP rsp;
++	WMI_CUSTOM_MACFILTER_CMD *cmd = (WMI_CUSTOM_MACFILTER_CMD *)buffer;
++	a_uint32_t i;
++
++	(void)Command;
++	if (buffer && Length >= (a_int32_t)sizeof(WMI_CUSTOM_MACFILTER_CMD)) {
++		a_uint32_t action = adf_os_ntohl(cmd->action);
++		a_uint32_t mode = adf_os_ntohl(cmd->mode);
++		a_uint32_t index = adf_os_ntohl(cmd->index);
++
++		switch (action) {
++		case CUSTOM_MF_ACTION_SETMODE:
++			if (mode <= 2)
++				custom_mf_mode = (a_uint8_t)mode;
++			break;
++		case CUSTOM_MF_ACTION_ADD:
++			if (index < CUSTOM_MACFILTER_MAX) {
++				for (i = 0; i < 6; i++)
++					custom_mf_mac[index][i] = cmd->mac[i];
++				if ((a_uint8_t)(index + 1) > custom_mf_count)
++					custom_mf_count = (a_uint8_t)(index + 1);
++			}
++			break;
++		case CUSTOM_MF_ACTION_DEL:
++			if (index < CUSTOM_MACFILTER_MAX)
++				adf_os_mem_set(custom_mf_mac[index], 0, 6);
++			break;
++		case CUSTOM_MF_ACTION_CLEAR:
++			adf_os_mem_set(custom_mf_mac, 0, sizeof(custom_mf_mac));
++			custom_mf_count = 0;
++			break;
++		case CUSTOM_MF_ACTION_QUERY:
++		default:
++			break;
++		}
++	}
++
++	rsp.mode = adf_os_htonl(custom_mf_mode);
++	rsp.count = adf_os_htonl(custom_mf_count);
++	rsp.dropped = adf_os_htonl(custom_mf_dropped);
++	wmi_cmd_rsp(sc->tgt_wmi_handle, Command, SeqNo,
++		    (A_UINT8 *)&rsp, sizeof(rsp));
++}
++
++/* CUSTOM BUILD v3: Block-ACK window runtime tuning (pow2, 1..64).
++ * Applies to TIDs initialised from now on; live nodes keep their window. */
++static void handle_baw_cmd(void *Context, A_UINT16 Command,
++			   A_UINT16 SeqNo, A_UINT8 *buffer,
++			   a_int32_t Length)
++{
++	struct ath_softc_tgt *sc = (struct ath_softc_tgt *)Context;
++	WMI_CUSTOM_BAW_RSP rsp;
++	a_uint32_t eff = custom_baw_size ? custom_baw_size : WME_MAX_BA;
++
++	(void)Command;
++	if (buffer && Length >= (a_int32_t)sizeof(WMI_CUSTOM_BAW_CMD)) {
++		a_uint32_t v = adf_os_ntohl(((WMI_CUSTOM_BAW_CMD *)buffer)->baw_size);
++
++		if (v >= 1 && v <= WME_BA_BMP_SIZE) {
++			while (v & (v - 1))
++				v++;
++			custom_baw_size = v;
++			eff = v;
++			custom_log_bb(7, eff);
++		}
++	}
++
++	rsp.effective = adf_os_htonl(eff);
++	wmi_cmd_rsp(sc->tgt_wmi_handle, Command, SeqNo,
++		    (A_UINT8 *)&rsp, sizeof(rsp));
++}
++
++/* CUSTOM BUILD v3: long-distance mode - MAC ACK timeout in microseconds. */
++static void handle_longdist_cmd(void *Context, A_UINT16 Command,
++				A_UINT16 SeqNo, A_UINT8 *buffer,
++				a_int32_t Length)
++{
++	struct ath_softc_tgt *sc = (struct ath_softc_tgt *)Context;
++	WMI_CUSTOM_LONGDIST_RSP rsp;
++	a_uint32_t reg = ioread32_mac(0x8014);   /* AR_TIME_OUT */
++	a_uint32_t cur = reg & 0x00003FFF;
++
++	(void)Command;
++	if (buffer && Length >= (a_int32_t)sizeof(WMI_CUSTOM_LONGDIST_CMD)) {
++		a_uint32_t v = adf_os_ntohl(((WMI_CUSTOM_LONGDIST_CMD *)buffer)->ack_timeout_us);
++
++		if (v >= 1 && v <= 0x3FFF) {
++			reg = (reg & ~0x00003FFF) | v;
++			iowrite32_mac(0x8014, reg);
++			cur = v;
++			custom_log_bb(8, v);
++		}
++	}
++
++	rsp.ack_timeout_us = adf_os_htonl(cur);
++	wmi_cmd_rsp(sc->tgt_wmi_handle, Command, SeqNo,
++		    (A_UINT8 *)&rsp, sizeof(rsp));
++}
++
++/* CUSTOM BUILD v3: the host reports the current channel; pair with NF. */
++static void handle_freq_note_cmd(void *Context, A_UINT16 Command,
++				 A_UINT16 SeqNo, A_UINT8 *buffer,
++				 a_int32_t Length)
++{
++	struct ath_softc_tgt *sc = (struct ath_softc_tgt *)Context;
++	WMI_CUSTOM_FREQ_NOTE_RSP rsp;
++	a_uint32_t freq = 0;
++	a_uint8_t i, slot;
++
++	(void)Command;
++	if (buffer && Length >= (a_int32_t)sizeof(WMI_CUSTOM_FREQ_NOTE_CMD))
++		freq = adf_os_ntohl(((WMI_CUSTOM_FREQ_NOTE_CMD *)buffer)->freq_mhz);
++
++	if (freq) {
++		slot = 0xFF;
++		for (i = 0; i < custom_fs_count; i++)
++			if (custom_fs_freq[i] == freq)
++				slot = i;
++		if (slot == 0xFF && custom_fs_count < 12)
++			slot = custom_fs_count++;
++		if (slot == 0xFF)
++			slot = (a_uint8_t)(custom_fs_rr++ % 12);
++		if (slot != 0xFF) {
++			custom_fs_freq[slot] = (a_uint16_t)freq;
++			custom_fs_nf[slot] = (a_int16_t)custom_read_nf(sc);
++			custom_log_bb(3, freq);
++		}
++	}
++
++	rsp.entries = adf_os_htonl(custom_fs_count);
++	wmi_cmd_rsp(sc->tgt_wmi_handle, Command, SeqNo,
++		    (A_UINT8 *)&rsp, sizeof(rsp));
++}
++
++/* CUSTOM BUILD v3: mini-NetFlow query/reset */
++static void handle_netflow_cmd(void *Context, A_UINT16 Command,
++			       A_UINT16 SeqNo, A_UINT8 *buffer,
++			       a_int32_t Length)
++{
++	struct ath_softc_tgt *sc = (struct ath_softc_tgt *)Context;
++	WMI_CUSTOM_NETFLOW_RSP rsp;
++	a_uint8_t do_reset = 0;
++	a_uint8_t i;
++
++	(void)Command;
++	if (buffer && Length >= (a_int32_t)sizeof(WMI_CUSTOM_NETFLOW_CMD))
++		do_reset = (adf_os_ntohl(((WMI_CUSTOM_NETFLOW_CMD *)buffer)->reset) == 1);
++
++	adf_os_mem_set(&rsp, 0, sizeof(rsp));
++	rsp.count = custom_nfl_count;
++	for (i = 0; i < custom_nfl_count; i++) {
++		a_uint16_t bytes = custom_nfl_bytes[i];
++
++		adf_os_mem_copy(rsp.ent[i].mac, custom_nfl_mac[i], 6);
++		rsp.ent[i].frames = adf_os_htons(custom_nfl_frames[i]);
++		/* v4-fix: single u16 in 256B units (saturating) keeps the reply
++		 * at 44B payload / 56B on the wire (the old 12B entry made the
++		 * reply exactly 64B and jammed the USB controller). */
++		rsp.ent[i].bytes_256 = adf_os_htons(bytes >> 8);
++	}
++
++	if (do_reset) {
++		adf_os_mem_set(custom_nfl_frames, 0, sizeof(custom_nfl_frames));
++		adf_os_mem_set(custom_nfl_bytes, 0, sizeof(custom_nfl_bytes));
++	}
++
++	wmi_cmd_rsp(sc->tgt_wmi_handle, Command, SeqNo,
++		    (A_UINT8 *)&rsp, sizeof(rsp));
++}
++
++/* CUSTOM BUILD v3: per-channel NF survey query */
++static void handle_chan_survey_cmd(void *Context, A_UINT16 Command,
++				   A_UINT16 SeqNo, A_UINT8 *buffer,
++				   a_int32_t Length)
++{
++	struct ath_softc_tgt *sc = (struct ath_softc_tgt *)Context;
++	WMI_CUSTOM_CHAN_SURVEY_RSP rsp;
++	a_uint8_t i;
++
++	(void)Command;
++	(void)buffer;
++	(void)Length;
++
++	adf_os_mem_set(&rsp, 0, sizeof(rsp));
++	rsp.count = custom_fs_count;
++	for (i = 0; i < custom_fs_count; i++) {
++		a_int32_t nf = custom_fs_nf[i];
++
++		/* v4-fix: reply nf is s8 now - clamp before narrowing */
++		if (nf > 0)
++			nf = 0;
++		if (nf < -128)
++			nf = -128;
++		rsp.ent[i].freq_mhz = adf_os_htons(custom_fs_freq[i]);
++		rsp.ent[i].nf_dbm = (a_int8_t)nf;
++	}
++
++	wmi_cmd_rsp(sc->tgt_wmi_handle, Command, SeqNo,
++		    (A_UINT8 *)&rsp, sizeof(rsp));
++}
++
++/* CUSTOM BUILD v3: firmware auto-spectral control */
++static void handle_auto_spec_cmd(void *Context, A_UINT16 Command,
++				 A_UINT16 SeqNo, A_UINT8 *buffer,
++				 a_int32_t Length)
++{
++	struct ath_softc_tgt *sc = (struct ath_softc_tgt *)Context;
++	WMI_CUSTOM_AUTO_SPEC_RSP rsp;
++
++	(void)Command;
++	if (buffer && Length >= (a_int32_t)sizeof(WMI_CUSTOM_AUTO_SPEC_CMD)) {
++		a_uint32_t en = adf_os_ntohl(((WMI_CUSTOM_AUTO_SPEC_CMD *)buffer)->enable);
++		a_uint32_t th = adf_os_ntohl(((WMI_CUSTOM_AUTO_SPEC_CMD *)buffer)->threshold);
++
++		if (en == 0 || en == 1) {
++			if (en == 0 && custom_spec_active) {
++				a_uint32_t reg = ioread32_mac(0x9910);
++				iowrite32_mac(0x9910, reg & ~0x00000003);
++				custom_spec_active = 0;
++			}
++			custom_spec_auto = (a_uint8_t)en;
++			custom_log_bb(6, en);
++		}
++		if (th >= 10 && th <= 900)
++			custom_spec_threshold = th;
++	}
++
++	rsp.enable = adf_os_htonl(custom_spec_auto);
++	rsp.threshold = adf_os_htonl(custom_spec_threshold);
++	rsp.active = adf_os_htonl(custom_spec_active);
++	wmi_cmd_rsp(sc->tgt_wmi_handle, Command, SeqNo,
++		    (A_UINT8 *)&rsp, sizeof(rsp));
++}
++
++/* CUSTOM BUILD v3: black-box ring buffer paging */
++static void handle_blackbox_cmd(void *Context, A_UINT16 Command,
++				A_UINT16 SeqNo, A_UINT8 *buffer,
++				a_int32_t Length)
++{
++	struct ath_softc_tgt *sc = (struct ath_softc_tgt *)Context;
++	WMI_CUSTOM_BLACKBOX_RSP rsp;
++	a_uint32_t page = 0;
++	a_uint8_t j;
++
++	(void)Command;
++	if (buffer && Length >= (a_int32_t)sizeof(WMI_CUSTOM_BLACKBOX_CMD))
++		page = adf_os_ntohl(((WMI_CUSTOM_BLACKBOX_CMD *)buffer)->page);
++	if (page >= 4)
++		page = 0;
++
++	adf_os_mem_set(&rsp, 0, sizeof(rsp));
++	rsp.head = custom_bb_head;
++	rsp.count = custom_bb_count;
++	for (j = 0; j < 4; j++) {
++		a_uint8_t idx = (a_uint8_t)((custom_bb_head + 16 - 1 -
++					     (page * 4 + j)) % 16);
++		rsp.ent[j] = adf_os_htonl(custom_bb[idx]);
++	}
++
++	wmi_cmd_rsp(sc->tgt_wmi_handle, Command, SeqNo,
++		    (A_UINT8 *)&rsp, sizeof(rsp));
++}
++
+ static void handle_rc_state_change_cmd(void *Context, A_UINT16 Command,
+ 				       A_UINT16 SeqNo, A_UINT8 *buffer, a_int32_t Length)
+ 
+@@ -1781,6 +2799,21 @@ static WMI_DISPATCH_ENTRY Magpie_Sys_DispatchEntries[] =
+ 	{ath_rx_stats_tgt,            WMI_RX_STATS_CMDID,           0},
+ 	{ath_rc_mask_tgt,             WMI_BITRATE_MASK_CMDID,       0},
+ 	{ath_hal_reg_rmw_tgt,         WMI_REG_RMW_CMDID,            0},
++	{handle_custom_ping_cmd,      WMI_CUSTOM_PING_CMDID,        0},
++	{handle_rc_profile_cmd,       WMI_CUSTOM_RC_PROFILE_CMDID,  0},
++	{handle_txpower_cmd,          WMI_CUSTOM_TXPOWER_CMDID,     0},
++	{handle_rate_usage_cmd,       WMI_CUSTOM_RATE_USAGE_CMDID,  0},
++	{handle_ani_auto_cmd,         WMI_CUSTOM_ANI_AUTO_CMDID,    0},
++	{handle_rssi_hist_cmd,        WMI_CUSTOM_RSSI_HIST_CMDID,   0},
++	{handle_macfilter_cmd,        WMI_CUSTOM_MACFILTER_CMDID,   0},
++	{handle_baw_cmd,              WMI_CUSTOM_BAW_CMDID,         0},
++	{handle_longdist_cmd,         WMI_CUSTOM_LONGDIST_CMDID,    0},
++	{handle_freq_note_cmd,        WMI_CUSTOM_FREQ_NOTE_CMDID,   0},
++	{handle_netflow_cmd,          WMI_CUSTOM_NETFLOW_CMDID,     0},
++	{handle_chan_survey_cmd,      WMI_CUSTOM_CHAN_SURVEY_CMDID, 0},
++	{handle_auto_spec_cmd,        WMI_CUSTOM_AUTO_SPEC_CMDID,   0},
++	{handle_blackbox_cmd,         WMI_CUSTOM_BLACKBOX_CMDID,    0},
++	{handle_thermal_cmd,          WMI_CUSTOM_THERMAL_CMDID,     0},
+ };
+ 
+ /*****************/
+diff --git a/target_firmware/wlan/if_owl.c b/target_firmware/wlan/if_owl.c
+index 919a478..3a1d116 100755
+--- a/target_firmware/wlan/if_owl.c
++++ b/target_firmware/wlan/if_owl.c
+@@ -461,7 +461,11 @@ static void ath_tgt_rate_findrate(struct ath_softc_tgt *sc,
+ 				  struct ath_rc_series series[],
+ 				  a_int32_t *isProbe)
+ {
+-	ath_rate_findrate(sc, an, 1, frameLen, 10, 4, 1,
++	/* CUSTOM BUILD: stepDnInc is now runtime-tunable via WMI
++	 * (WMI_CUSTOM_RC_PROFILE_CMDID from the host).
++	 * 1 = clean-air profile, 2 = noisy-air profile (faster fallback). */
++	extern a_uint32_t custom_rc_step_dn_inc;   /* defined in if_ath.c */
++	ath_rate_findrate(sc, an, 1, frameLen, 10, 4, custom_rc_step_dn_inc,
+ 			  ATH_RC_PROBE_ALLOWED, series, isProbe);
+ }
+ 
+@@ -1209,11 +1213,16 @@ ath_tgt_send_mgt(struct ath_softc_tgt *sc,adf_nbuf_t hdr_buf, adf_nbuf_t skb,
+ 
+ 	flags |= HAL_TXDESC_INTREQ;
+ 
++	/* CUSTOM BUILD: per-frame TX power is runtime-tunable via WMI
++	 * (WMI_CUSTOM_TXPOWER_CMDID). The stock firmware hardcodes 60 here.
++	 * CUSTOM BUILD v4: goes through the thermal governor (link-quality
++	 * cap + optional duty backoff), not the raw override. */
++	extern a_uint8_t custom_tx_power_effective(void);   /* defined in if_ath.c */
+ 	ah->ah_setupTxDesc(ds
+ 			    , pktlen
+ 			    , hdrlen
+ 			    , atype
+-			    , 60
++			    , custom_tx_power_effective()
+ 			    , txrate, try0
+ 			    , keyix
+ 			    , flags
+diff --git a/target_firmware/wlan/include/k2/wlan_cfg.h b/target_firmware/wlan/include/k2/wlan_cfg.h
+index 85a04c9..977e10c 100755
+--- a/target_firmware/wlan/include/k2/wlan_cfg.h
++++ b/target_firmware/wlan/include/k2/wlan_cfg.h
+@@ -81,7 +81,11 @@
+ #define ATH_ENABLE_WLAN_FOR_K2
+ 
+ #define ATH_VERSION_MAJOR 1
+-#define ATH_VERSION_MINOR 4
++/* CUSTOM BUILD: minor bumped 4 -> 5. IMPORTANT: the firmware image that runs
++ * on the AR9271 USB card is produced by the TARGET_K2 configuration (this
++ * file) - verified by size fingerprint against the stock 1.4.0 release
++ * (51008 -> 51016 = exactly our +8 byte WMI dispatch entry). */
++#define ATH_VERSION_MINOR 5
+ 
+ /************************** HAL configurations **************************/
+ 
+diff --git a/target_firmware/wlan/include/magpie/wlan_cfg.h b/target_firmware/wlan/include/magpie/wlan_cfg.h
+index ebd7a69..e577238 100755
+--- a/target_firmware/wlan/include/magpie/wlan_cfg.h
++++ b/target_firmware/wlan/include/magpie/wlan_cfg.h
+@@ -66,7 +66,9 @@
+ #define ATH_SUPPORT_A_MODE
+ 
+ #define ATH_VERSION_MAJOR 1
+-#define ATH_VERSION_MINOR 4
++/* CUSTOM BUILD: minor bumped 4 -> 5 to identify custom firmware builds.
++ * The driver accepts any minor >= 3 and reports "FW Version: 1.5". */
++#define ATH_VERSION_MINOR 5
+ 
+ /************************** HAL configurations **************************/
+ 
+diff --git a/target_firmware/wlan/include/wlan_hdr.h b/target_firmware/wlan/include/wlan_hdr.h
+index b343637..cd616b4 100755
+--- a/target_firmware/wlan/include/wlan_hdr.h
++++ b/target_firmware/wlan/include/wlan_hdr.h
+@@ -96,7 +96,10 @@ struct ieee80211com_target {
+ 	a_uint8_t     pad;
+ };
+ 
+-#define ATH_NODE_MAX 8       /* max no. of nodes */
++/* CUSTOM BUILD: 8 -> 16 nodes, matches driver ATH9K_HTC_MAX_STA.
++ * RAM cost: +8 * sizeof(struct ath_node_target) in target statics;
++ * the linker (ram-magpie.ld) will fail loudly if the budget overflows. */
++#define ATH_NODE_MAX 16      /* max no. of nodes */
+ #define ATH_VAP_MAX  2       /* max no. of vaps */
+ 
+ #define VAP_TARGET_SIZE 12
+diff --git a/target_firmware/wlan/include/wmi.h b/target_firmware/wlan/include/wmi.h
+index 194c38e..b9e6b9b 100755
+--- a/target_firmware/wlan/include/wmi.h
++++ b/target_firmware/wlan/include/wmi.h
+@@ -163,8 +163,184 @@ typedef enum {
+     WMI_RX_STATS_CMDID,
+     WMI_BITRATE_MASK_CMDID,
+     WMI_REG_RMW_CMDID,
++    /* CUSTOM BUILD: must match enum wmi_cmd_id in the Linux driver's wmi.h */
++    WMI_CUSTOM_PING_CMDID,
++    WMI_CUSTOM_RC_PROFILE_CMDID,
++    WMI_CUSTOM_TXPOWER_CMDID,
++    WMI_CUSTOM_RATE_USAGE_CMDID,
++    WMI_CUSTOM_ANI_AUTO_CMDID,
++    WMI_CUSTOM_RSSI_HIST_CMDID,
++    WMI_CUSTOM_MACFILTER_CMDID,
++    WMI_CUSTOM_BAW_CMDID,
++    WMI_CUSTOM_LONGDIST_CMDID,
++    WMI_CUSTOM_FREQ_NOTE_CMDID,
++    WMI_CUSTOM_NETFLOW_CMDID,
++    WMI_CUSTOM_CHAN_SURVEY_CMDID,
++    WMI_CUSTOM_AUTO_SPEC_CMDID,
++    WMI_CUSTOM_BLACKBOX_CMDID,
++    WMI_CUSTOM_THERMAL_CMDID,
+ } WMI_COMMAND_ID;
+ 
++/*
++ * CUSTOM BUILD: custom ping command/response (host -> target -> host)
++ */
++typedef PREPACK struct {
++    A_UINT32 payload;
++} POSTPACK WMI_CUSTOM_PING_CMD;
++
++typedef PREPACK struct {
++    A_UINT32 echo_payload;
++    A_UINT32 pong_counter;
++    /* CUSTOM BUILD v3-diag: target-side control-path health counters,
++     * filled by handle_custom_ping_cmd from live globals. 24B total -
++     * well under the 64B reply budget. */
++    A_UINT32 diag_rx_cmds;       /* commands received on the CTL endpoint   */
++    A_UINT32 diag_send_dones;    /* WMI buffers returned by HTC send-done  */
++    A_UINT32 diag_rsp_entries;   /* wmi_cmd_rsp invocations                */
++    A_UINT32 diag_rsp_allocfail; /* WMI_AllocEvent failures in wmi_cmd_rsp */
++    A_UINT32 diag_pool_memfail;  /* buffers with NULL data area at boot    */
++    A_UINT32 diag_evt_entries;   /* target->host events sent (SWBA/...)    */
++} POSTPACK WMI_CUSTOM_PING_RSP;
++
++/*
++ * CUSTOM BUILD: runtime rate-control profile (host -> target -> host).
++ * step_dn_inc = 1 -> clean-air profile (slower fallback)
++ * step_dn_inc = 2 -> noisy-air profile (faster fallback)
++ * step_dn_inc = 0 -> keep current value (query only)
++ * fixed_rate_idx: 0xFF = auto rate control, 0x00-0x7F = fixed rate table
++ *                 index, anything else = keep current.
++ */
++typedef PREPACK struct {
++    A_UINT32 step_dn_inc;
++    A_UINT32 fixed_rate_idx;
++    A_UINT32 num_tries;      /* CUSTOM BUILD v3: 0 = keep, else 1..32 */
++    A_UINT32 num_rates;      /* CUSTOM BUILD v3: 0 = keep, else 1..4 */
++} POSTPACK WMI_CUSTOM_RC_PROFILE_CMD;
++
++typedef PREPACK struct {
++    A_UINT32 step_dn_inc;    /* current effective value */
++    A_UINT32 fixed_rate_idx; /* current effective value */
++    A_UINT32 num_tries;      /* current effective value */
++    A_UINT32 num_rates;      /* current effective value */
++} POSTPACK WMI_CUSTOM_RC_PROFILE_RSP;
++
++/*
++ * CUSTOM BUILD: per-frame TX power override (host -> target -> host).
++ * The stock firmware hardcodes 60 (of 0..63) as the descriptor XmitPower.
++ * tx_power = 0xFF -> query only (keep current), 0x00-0x3F -> set.
++ */
++typedef PREPACK struct {
++    A_UINT32 tx_power;
++} POSTPACK WMI_CUSTOM_TXPOWER_CMD;
++
++typedef PREPACK struct {
++    A_UINT32 tx_power;       /* current effective value */
++} POSTPACK WMI_CUSTOM_TXPOWER_RSP;
++
++/*
++ * CUSTOM BUILD v2: firmware-resident extensions
++ */
++
++typedef PREPACK struct {
++    A_UINT32 seq;        /* sample counter */
++    A_UINT32 uptime_s;   /* seconds since target boot (tick-based) */
++    A_UINT32 freq_mhz;   /* current channel center frequency */
++    A_INT32  nf_dbm;     /* last latched noise floor (chain 0) */
++    A_UINT32 rx_frames;  /* frames received in the last window */
++    A_UINT32 phy_errs;   /* phy-error frames in the last window */
++    A_UINT32 ani_level;  /* current firstep level 0..2 */
++} POSTPACK WMI_CUSTOM_TELEMETRY_EVT;
++
++/* per-rate TX usage histogram (counted at rate-series build time) */
++#define WMI_CUSTOM_RATE_USAGE_MAX 32
++typedef PREPACK struct {
++    A_UINT32 reset;                                   /* 1 = reset after read */
++} POSTPACK WMI_CUSTOM_RATE_USAGE_CMD;
++
++typedef PREPACK struct {
++    A_UINT8  usage[WMI_CUSTOM_RATE_USAGE_MAX];        /* saturated at 255;
++							 keep replies SMALL! */
++} POSTPACK WMI_CUSTOM_RATE_USAGE_RSP;
++
++/* firmware-side adaptive ANI (firstep auto-stepping on PHY error rate) */
++typedef PREPACK struct {
++    A_UINT32 enable;    /* 0xFF = query, 0 = manual, 1 = firmware adaptive */
++} POSTPACK WMI_CUSTOM_ANI_AUTO_CMD;
++
++typedef PREPACK struct {
++    A_UINT32 enable;    /* current state */
++    A_UINT32 level;     /* current firstep level 0..2 */
++    A_UINT32 phy_errs;  /* phy-error frames in the last window */
++} POSTPACK WMI_CUSTOM_ANI_AUTO_RSP;
++
++/* RSSI histogram (64 bins, 1 dB bins, u8 saturated counters) */
++#define WMI_CUSTOM_RSSI_HIST_BINS 48
++typedef PREPACK struct {
++    A_UINT32 reset;    /* 0xFF = query, 1 = reset after read */
++} POSTPACK WMI_CUSTOM_RSSI_HIST_CMD;
++
++typedef PREPACK struct {
++    /* no total field: the driver sums the bins (reply budget!) */
++    A_UINT8  bins[WMI_CUSTOM_RSSI_HIST_BINS];
++} POSTPACK WMI_CUSTOM_RSSI_HIST_RSP;
++
++/* radio-level MAC filter, applied before frames are uploaded over USB */
++#define WMI_CUSTOM_MACFILTER_MAX 8
++#define CUSTOM_MF_ACTION_QUERY   0
++#define CUSTOM_MF_ACTION_SETMODE 1
++#define CUSTOM_MF_ACTION_ADD     2
++#define CUSTOM_MF_ACTION_DEL     3
++#define CUSTOM_MF_ACTION_CLEAR   4
++
++typedef PREPACK struct {
++    A_UINT32 action;   /* CUSTOM_MF_ACTION_* */
++    A_UINT32 mode;     /* 0 = off, 1 = allow-list, 2 = block-list */
++    A_UINT32 index;    /* entry index for add/del (0..7) */
++    A_UINT8  mac[6];
++} POSTPACK WMI_CUSTOM_MACFILTER_CMD;
++
++typedef PREPACK struct {
++    A_UINT32 mode;
++    A_UINT32 count;
++    A_UINT32 dropped;   /* frames dropped by the radio-level filter */
++} POSTPACK WMI_CUSTOM_MACFILTER_RSP;
++
++/*
++ * CUSTOM BUILD v4 (thermal): heat governor control + link-aware TX power
++ * cap. The AR9271 exposes no readable die-temperature register, so
++ * "thermal" means managing the dominant heat sources directly: the PA
++ * output power (descriptor XmitPower) and the TX duty cycle. The governor
++ * lives in the 2s RX-driven tick (if_ath.c); it generates no periodic WMI
++ * traffic (docs/10 golden rule #4).
++ */
++#define CUSTOM_TH_QUERY          0xFF   /* mode: query-only */
++#define CUSTOM_TH_CAP_QUERY      0x100  /* cap: query-only */
++#define CUSTOM_TH_CAP_UNCAPPED   0xFF   /* cap: remove the static cap
++                                           (docs/12: "cap 255 = uncapped" -
++                                           unreachable before v4-fix, the
++                                           old code intercepted 0xFF as the
++                                           query marker for BOTH fields) */
++#define CUSTOM_TH_FLAG_HOOKS_ON  0x1   /* set custom_rx_hooks = 1 */
++#define CUSTOM_TH_FLAG_HOOKS_OFF 0x2   /* set custom_rx_hooks = 0 */
++
++typedef PREPACK struct {
++    A_UINT32 mode;     /* CUSTOM_TH_QUERY = query, else bit0 = RSSI cap,
++                          bit1 = duty backoff */
++    A_UINT32 cap;      /* 0x00-0x3F = static cap, CUSTOM_TH_CAP_UNCAPPED =
++                          remove cap, CUSTOM_TH_CAP_QUERY = query only */
++    A_UINT32 flags;    /* CUSTOM_TH_FLAG_* (0 = leave hooks untouched) */
++} POSTPACK WMI_CUSTOM_THERMAL_CMD;
++
++typedef PREPACK struct {
++    A_UINT32 mode;       /* active governor mode bits */
++    A_UINT32 cap;        /* static cap as configured (0xFF = uncapped) */
++    A_UINT32 backoff;    /* dynamic duty backoff, descriptor power steps */
++    A_UINT32 effective;  /* XmitPower applied to data frames right now */
++    A_UINT32 avg_rssi;   /* window-average RSSI (0 = no RX traffic yet) */
++    A_UINT32 tx_window;  /* TX rate-usage delta over the last tick */
++    A_UINT32 rx_window;  /* RX frames over the last tick */
++} POSTPACK WMI_CUSTOM_THERMAL_RSP;
++
+ /*
+  * Frame Types
+  */
+@@ -269,7 +445,9 @@ typedef enum {
+     WMI_TXTO_EVENTID,
+     WMI_BMISS_EVENTID,
+     WMI_DELBA_EVENTID,
+-    WMI_TXSTATUS_EVENTID
++    WMI_TXSTATUS_EVENTID,
++    /* CUSTOM BUILD v2: periodic telemetry (must match driver enum append) */
++    WMI_CUSTOM_TELEMETRY_EVENTID
+ } WMI_EVENT_ID;
+ 
+ typedef PREPACK struct {
+@@ -304,4 +482,100 @@ struct register_rmw {
+ }
+ #endif
+ 
++/*
++ * CUSTOM BUILD v3: firmware-resident services.
++ * RULE: every reply struct stays at or below 64 bytes (reply pool budget!)
++ */
++#define WMI_CUSTOM_NETFLOW_MAX 4
++#define WMI_CUSTOM_CHAN_SURVEY_MAX 12
++#define WMI_CUSTOM_BB_PAGES 4
++#define WMI_CUSTOM_BB_PER_PG 4
++
++/* Block-ACK window runtime tuning (power of two, 1..64) */
++typedef PREPACK struct {
++    A_UINT32 baw_size;   /* 0xFF = query, else new size */
++} POSTPACK WMI_CUSTOM_BAW_CMD;
++
++typedef PREPACK struct {
++    A_UINT32 effective;
++} POSTPACK WMI_CUSTOM_BAW_RSP;
++
++/* Long-distance mode: MAC ACK timeout in microseconds (reg 0x8014) */
++typedef PREPACK struct {
++    A_UINT32 ack_timeout_us;   /* 0xFF = query, else 1..16383 */
++} POSTPACK WMI_CUSTOM_LONGDIST_CMD;
++
++typedef PREPACK struct {
++    A_UINT32 ack_timeout_us;
++} POSTPACK WMI_CUSTOM_LONGDIST_RSP;
++
++/* host notifies the target of the current channel (NF survey pairing) */
++typedef PREPACK struct {
++    A_UINT32 freq_mhz;
++} POSTPACK WMI_CUSTOM_FREQ_NOTE_CMD;
++
++typedef PREPACK struct {
++    A_UINT32 entries;
++} POSTPACK WMI_CUSTOM_FREQ_NOTE_RSP;
++
++/* mini-NetFlow: per-MAC frame/byte accounting (4 entries, u16 saturated) */
++typedef PREPACK struct {
++    A_UINT32 reset;   /* 1 = reset frames/bytes after read */
++} POSTPACK WMI_CUSTOM_NETFLOW_CMD;
++
++/* CUSTOM BUILD v4-fix: the old layout was actually 4*12+4 = 52B payload (the
++ * "4*10" comment was wrong) = 64B on the wire bare (8B HTC + 4B WMI hdr) -
++ * exactly the EP3 max packet size, which jams the USB controller after
++ * transmission (usbmon evidence). bytes is now ONE u16 in 256B units
++ * (saturating), so an entry is the 10B the comment always claimed and the
++ * reply is 44B payload = 56B on the wire, below the boundary. */
++typedef PREPACK struct {
++    A_UINT8  count;
++    A_UINT8  rsv[3];
++    struct {
++        A_UINT8  mac[6];
++        A_UINT16 frames;
++        A_UINT16 bytes_256;   /* bytes >> 8, saturating at 0xFFFF (~16MB) */
++    } ent[WMI_CUSTOM_NETFLOW_MAX];
++} POSTPACK WMI_CUSTOM_NETFLOW_RSP;   /* 4 + 4*10 = 44 bytes */
++
++/* per-channel NF survey (12 entries)
++ * CUSTOM BUILD v4-fix: the old layout (nf as s16) made the reply 52B payload
++ * = 64B on the wire bare (8B HTC + 4B WMI hdr + 52B) - exactly the EP3 max
++ * packet size, which jams the USB controller after transmission (usbmon
++ * evidence, docs/10). nf is now s8 (NF is coarse; -128..0 dBm covers it), so
++ * the reply is 38B payload = 46B on the wire, safely below the boundary. */
++typedef PREPACK struct {
++    A_UINT8  count;
++    A_UINT8  rsv;
++    struct {
++        A_UINT16 freq_mhz;
++        A_INT8   nf_dbm;
++    } ent[WMI_CUSTOM_CHAN_SURVEY_MAX];
++} POSTPACK WMI_CUSTOM_CHAN_SURVEY_RSP;   /* 2 + 12*3 = 38 bytes */
++
++/* firmware auto-spectral: burst on PHY-error spikes */
++typedef PREPACK struct {
++    A_UINT32 enable;     /* 0xFF = query, 0 = off, 1 = on */
++    A_UINT32 threshold;  /* phy-err rate (per-mille) trigger */
++} POSTPACK WMI_CUSTOM_AUTO_SPEC_CMD;
++
++typedef PREPACK struct {
++    A_UINT32 enable;
++    A_UINT32 threshold;
++    A_UINT32 active;
++} POSTPACK WMI_CUSTOM_AUTO_SPEC_RSP;
++
++/* black-box ring buffer (16 events, 4 per page) */
++typedef PREPACK struct {
++    A_UINT32 page;   /* 0..3 */
++} POSTPACK WMI_CUSTOM_BLACKBOX_CMD;
++
++typedef PREPACK struct {
++    A_UINT8  head;
++    A_UINT8  count;
++    A_UINT8  rsv[2];
++    A_UINT32 ent[WMI_CUSTOM_BB_PER_PG];   /* type<<24 | data&0xFFFFFF */
++} POSTPACK WMI_CUSTOM_BLACKBOX_RSP;   /* 4 + 16 = 20 bytes */
++
+ #endif /* _WMI_H_ */
+diff --git a/target_firmware/wlan/ratectrl_11n_ln.c b/target_firmware/wlan/ratectrl_11n_ln.c
+index bf4b945..560e012 100755
+--- a/target_firmware/wlan/ratectrl_11n_ln.c
++++ b/target_firmware/wlan/ratectrl_11n_ln.c
+@@ -542,12 +542,20 @@ rcRateFind_ht(struct ath_softc_tgt *sc, struct atheros_node *pSib,
+ 	return rate;
+ }
+ 
++/* CUSTOM BUILD v2: per-rate TX usage counters (read via WMI_CUSTOM_RATE_USAGE_CMDID).
++ * Incremented at series-build time - each entry counts one rate selection. */
++a_uint32_t custom_rate_usage[32] = { 0 };
++
+ static void
+ rcRateSetseries(const RATE_TABLE_11N *pRateTable ,
+                 struct ath_rc_series *series,
+ 		A_UINT8 tries, A_UINT8 rix,
+ 		A_BOOL rtsctsenable, A_UINT32 chainmask,int stbc)
+ {
++	/* CUSTOM BUILD v2: count this rate selection */
++	if (rix < 32 && custom_rate_usage[rix] != 0xFFFFFFFF)
++		custom_rate_usage[rix]++;
++
+ 	series->tries = tries;
+ 	series->flags = (rtsctsenable? ATH_RC_RTSCTS_FLAG : 0) |
+ 		(WLAN_RC_PHY_DS(pRateTable->info[rix].phy) ? ATH_RC_DS_FLAG : 0) |
+@@ -626,6 +634,26 @@ void rcRateFind_11n(struct ath_softc_tgt *sc, struct ath_node_target *an,
+ 	A_UINT8 dot11Rate;
+ 	WLAN_PHY phy;
+ 
++	/* CUSTOM BUILD: runtime fixed-rate override (0xFF = auto rate control).
++	 * Builds the whole multirate series at one fixed rate table index. */
++	extern a_uint8_t custom_rc_fixed_rate;   /* defined in if_ath.c */
++	if (custom_rc_fixed_rate != 0xFF) {
++		A_UINT8 fixed_rix = custom_rc_fixed_rate;
++		if (fixed_rix >= pRateTable->rateCount)
++			fixed_rix = pRateTable->rateCount - 1;
++		tryPerRate = numTries / numRates;
++		rcRateSetseries(pRateTable, &series[i++], tryPerRate, fixed_rix,
++				FALSE, asc->tx_chainmask, asn->stbc);
++		for (; i < numRates; i++) {
++			A_UINT8 tryNum = ((i + 1) == numRates) ?
++				(numTries - tryPerRate * (numRates - 1)) : tryPerRate;
++			rcRateSetseries(pRateTable, &series[i], tryNum, fixed_rix,
++					TRUE, asc->tx_chainmask, asn->stbc);
++		}
++		*isProbe = FALSE;
++		return;
++	}
++
+ 	rix = rcRateFind_ht(sc, asn, pRateTable, (rcflag & ATH_RC_PROBE_ALLOWED) ? 1 : 0,
+ 			    isProbe);
+ 	nrix = rix;
