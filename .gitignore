@@ -13,6 +13,12 @@ sources/open-ath9k-htc-firmware/toolchain/
 sources/open-ath9k-htc-firmware/target_firmware/htc_9271.fw
 *.elf
 *.map
+*.objdump
+*.out
+
+# build mirror + session logs (created next to/inside the repo by the scripts)
+ath9k-fw-build/
+logs/
 
 # local soak/session logs
 *.log
