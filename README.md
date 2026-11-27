@@ -50,6 +50,9 @@ flowchart LR
 
 ```text
 ├── README.md                     ← you are here (EN + AR)
+├── LICENSE                       ← GPL-2.0
+├── THIRD_PARTY_NOTICES.md        ← upstream components under sources/ + their licenses
+├── .github/workflows/lint.yml    ← CI: shellcheck + markdown link check (no hardware needed)
 ├── docs/                         ← the full documentation set (see docs/README.md for the index)
 │   ├── 01…04   hardware · stock driver/firmware · device status · usage
 │   ├── 06…09   custom build pipeline · feature roadmap · firmware batches v2/v3
@@ -101,6 +104,9 @@ flowchart LR
 (`linux-headers-$(uname -r)`, 6.12.x tested); `rsync`, `curl`, `bc`, `iw`, `usbutils`.
 
 ```bash
+# 0) optional: verify the prebuilt firmware image before flashing
+sha256sum -c firmware/SHA256SUMS
+
 # 1) build (reads sources/ inside this repo)
 ./scripts/build/driver-build.sh      # → ath9k_htc.ko + ath9k_common.ko (spectral enabled)
 ./scripts/build/fw-build.sh          # → builds the Xtensa toolchain, then htc_9271.fw
@@ -252,6 +258,7 @@ regulatory limits — the docs deliberately treat power above the calibrated def
 > [sources/README.md](sources/README.md).
 
 ```bash
+sha256sum -c firmware/SHA256SUMS        # 0) اختياري: تحقق من صورة الفيرموير الجاهزة قبل الفلاش
 ./scripts/build/driver-build.sh      # → ath9k_htc.ko + ath9k_common.ko (spectral مفعّل)
 ./scripts/build/fw-build.sh          # يبني toolchain Xtensa + الفيرموير (أول مرة ~30-70 دقيقة)
 sudo ./scripts/deploy.sh && sudo ./scripts/test-all.sh     # المتوقع: 51 PASS / 2 FAIL موثقين

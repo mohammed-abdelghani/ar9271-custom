@@ -1,0 +1,41 @@
+name: lint
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - name: Shellcheck scripts/ (severity: warning)
+        run: find scripts -name '*.sh' -print0 | xargs -0 shellcheck -S warning
+
+  markdown-links:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check relative links in README.md and docs/
+        run: |
+          python3 - <<'EOF'
+          import os, re, sys
+          targets = ["README.md"] + [
+              os.path.join("docs", f) for f in sorted(os.listdir("docs")) if f.endswith(".md")
+          ]
+          bad = []
+          for path in targets:
+              text = open(path, encoding="utf8").read()
+              for m in re.finditer(r"\]\(([^)\s]+)\)", text):
+                  link = m.group(1).split("#")[0]
+                  if not link or link.startswith(("http://", "https://", "mailto:")):
+                      continue
+                  if not os.path.exists(os.path.normpath(os.path.join(os.path.dirname(path), link))):
+                      bad.append(f"{path}: {m.group(1)}")
+          if bad:
+              print("\n".join(bad))
+              sys.exit(1)
+          print(f"all relative links OK ({len(targets)} files)")
+          EOF
