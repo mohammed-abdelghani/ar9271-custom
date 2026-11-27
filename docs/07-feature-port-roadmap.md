@@ -48,7 +48,7 @@ Capabilities: 0x116e
 sudo apt install iw
 iw phy   # البحث عن "HT20" في قدرات الكارت
 # الاتصال براوتر 11n ثم:
-iw dev wlxf8d111b37c15 link   # فحص المعدل المفاوض (MCS أو ليجاسي)
+iw dev wlx001122334455 link   # فحص المعدل المفاوض (MCS أو ليجاسي)
 ```
 - لو MCS ظهر → الميزة شغالة أصلاً والتسمية 54Mbps تسويقية
 - لو انحشرت على legacy → نحدد الـ gate (EEPROM opflags أو ht_cap masking) ونرقعه في بنائنا
@@ -59,12 +59,12 @@ iw dev wlxf8d111b37c15 link   # فحص المعدل المفاوض (MCS أو ل�
 
 **الأوامر الصحيحة** (القيم المقبولة في `spectral_scan_ctl`: `manual` / `trigger` / `background` / `chanscan` / `disable` — لا يوجد "enable"):
 ```bash
-N=$(cat /sys/class/net/wlxf8d111b37c15/phy80211/index)
+N=$(cat /sys/class/net/wlx001122334455/phy80211/index)
 D=/sys/kernel/debug/ieee80211/phy$N/ath9k_htc
 echo manual  | sudo tee $D/spectral_scan_ctl
 echo trigger | sudo tee $D/spectral_scan_ctl
-sudo ip link set wlxf8d111b37c15 down; sudo iw dev wlxf8d111b37c15 set type monitor; sudo ip link set wlxf8d111b37c15 up
-sudo iw dev wlxf8d111b37c15 set channel 6
+sudo ip link set wlx001122334455 down; sudo iw dev wlx001122334455 set type monitor; sudo ip link set wlx001122334455 up
+sudo iw dev wlx001122334455 set channel 6
 sudo timeout 10 cat $D/spectral_scan0 > /tmp/spec0.bin
 echo disable | sudo tee $D/spectral_scan_ctl
 ```

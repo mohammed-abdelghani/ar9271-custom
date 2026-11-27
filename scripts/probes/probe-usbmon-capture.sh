@@ -14,12 +14,15 @@ MON=/tmp/usbmon-capture.txt
 # 1) fresh load, NM isolated
 "$B/probe-fresh-reload.sh" || exit 1
 
-IFACE=wlxf8d111b37c15
-[ -d "/sys/class/net/$IFACE" ] || IFACE=$(ls /sys/class/net/ | grep '^wlx' | head -1)
+IFACE=$(ls /sys/class/net/ 2>/dev/null | grep '^wlx' | head -1)
+[ -n "$IFACE" ] || { echo "FAIL: no wlx iface"; exit 1; }
 N=$(cat "/sys/class/net/$IFACE/phy80211/index")
 D="/sys/kernel/debug/ieee80211/phy$N/ath9k_htc"
-DEVNUM=$(cat "/sys/bus/usb/devices/2-1.2/devnum" 2>/dev/null)
-BUSNUM=$(cat "/sys/bus/usb/devices/2-1.2/busnum" 2>/dev/null)
+# USB device node — resolved via the bound ath9k_htc driver, not a fixed path
+USBIF=$(basename "$(ls -d /sys/bus/usb/drivers/ath9k_htc/*:* 2>/dev/null | head -1)")
+USBDEV=${USBIF%%:*}
+DEVNUM=$(cat "/sys/bus/usb/devices/$USBDEV/devnum" 2>/dev/null)
+BUSNUM=$(cat "/sys/bus/usb/devices/$USBDEV/busnum" 2>/dev/null)
 echo "capture target: bus=$BUSNUM dev=$DEVNUM phy=$N"
 
 modprobe usbmon 2>/dev/null

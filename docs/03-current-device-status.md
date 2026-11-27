@@ -27,21 +27,21 @@ Bus 002 Device 005: ID 0cf3:1006 Qualcomm Atheros Communications
 
 | الحقل | القيمة |
 |---|---|
-| **اسم الإنترفيس** | `wlxf8d111b37c15` |
-| **MAC** | `f8:d1:11:b3:7c:15` (بادئة TP-Link) |
+| **اسم الإنترفيس** | `wlx001122334455` |
+| **MAC** | `00:11:22:33:44:55` (قيمة مُعمّاة للنشر — بادئة TP-Link) |
 | **phy** | `phy2` |
-| **الدرايفر المرتبط** | `ath9k_htc` (`/sys/class/net/wlxf8d111b37c15/device/driver` → `bus/usb/drivers/ath9k_htc`) |
+| **الدرايفر المرتبط** | `ath9k_htc` (`/sys/class/net/wlx001122334455/device/driver` → `bus/usb/drivers/ath9k_htc`) |
 | **حالة الواجهة** | `UP` لكن `NO-CARRIER` — أي الواجهة مفعّلة لكن الكارت **غير متصل بأي شبكة حالياً** |
 
-الاسم `wlxf8d111b37c15` ليس عشوائياً: لينكس يسمّي كروت الـ USB اللاسلكية بالصيغة `wlx` + عنوان MAC بدون نقطتين.
+الاسم `wlx001122334455` ليس عشوائياً: لينكس يسمّي كروت الـ USB اللاسلكية بالصيغة `wlx` + عنوان MAC بدون نقطتين (القيم هنا مُعمّاة — اسم إنترفيسك الفعلي مشتق من MAC جهازك).
 
 ## 3️⃣ حالة الشبكة (من `nmcli`)
 
 ```
 DEVICE                  TYPE      STATE          CONNECTION
 wlp2s0                  wifi      connected      …          ← واي فاي اللابتوب الداخلي (Intel) — هو المتصل بالإنترنت
-wlxf8d111b37c15         wifi      disconnected   --          ← ⬅ هذا الكارت: متصل بالجهاز لكن غير موصول بشبكة
-p2p-dev-wlxf8d111b37c15 wifi-p2p  disconnected   --
+wlx001122334455         wifi      disconnected   --          ← ⬅ هذا الكارت: متصل بالجهاز لكن غير موصول بشبكة
+p2p-dev-wlx001122334455 wifi-p2p  disconnected   --
 ```
 
 **الخلاصة:** الكارت **شغّال ومعترَف به بالكامل** (جهاز USB + درايفر + فيرموير + إنترفيس شبكي)، لكنه حالياً **مستني** وغير متصل بأي شبكة واي فاي. أما الإنترنت الحالي على الجهاز فآتٍ من واي فاي اللابتوب الداخلي (`wlp2s0`).
@@ -75,7 +75,7 @@ sudo apt install iw wireless-tools aircrack-ng
 lsusb | grep -i 0cf3:1006
 
 # هل الإنترفيس موجود ومرتبط بالدرايفر؟
-ls -l /sys/class/net/wlxf8d111b37c15/device/driver
+ls -l /sys/class/net/wlx001122334455/device/driver
 
 # ما حالة الشبكة؟
 nmcli device status

@@ -5,12 +5,12 @@
 set -euo pipefail
 
 KVER=$(uname -r)
-IFACE=wlxf8d111b37c15
+IFACE=$(ls /sys/class/net/ 2>/dev/null | grep '^wlx' | head -1)
 
 [ "$(id -u)" -eq 0 ] || { echo "Run with sudo: sudo $0"; exit 1; }
 
 echo "== removing custom modules from updates/ =="
-ip link set "$IFACE" down 2>/dev/null || true
+[ -n "$IFACE" ] && ip link set "$IFACE" down 2>/dev/null || true
 modprobe -r ath9k_htc 2>/dev/null || true
 rm -f "/lib/modules/$KVER/updates/ath9k_htc.ko"
 rm -f "/lib/modules/$KVER/updates/ath9k_common.ko"

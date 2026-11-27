@@ -3,8 +3,8 @@
 Operational tooling for the custom build. The build scripts read the **already-patched** sources from
 [`../sources/`](../sources/README.md) inside this repo; outputs go to a space-free mirror — override with
 `BUILD_DIR` env (default `~/ath9k-fw-build`) — because the upstream firmware Makefile breaks on paths
-containing spaces. `deploy.sh` defaults to the interface name of the author's stick (`wlxf8d111b37c15` =
-`wlx` + the adapter's USB MAC — constant per physical adapter); override with `IFACE` env.
+containing spaces. Scripts auto-detect the `wlx*` interface (=`wlx` + the adapter's USB MAC — constant
+per physical adapter); override with `IFACE`/`ATH9K_IFACE` env where supported.
 
 | Script | Purpose | Docs |
 |---|---|---|

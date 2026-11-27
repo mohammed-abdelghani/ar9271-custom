@@ -24,7 +24,9 @@
 # Run: sudo ./ath9k-watchdog.sh --install   (then it loops as the systemd unit)
 set -uo pipefail
 
-IFACE=wlxf8d111b37c15
+# iface is auto-detected each check (wlx* = wlx + the adapter's USB MAC);
+# override with ATH9K_IFACE=wlx... if several wlx interfaces exist
+IFACE="${ATH9K_IFACE:-}"
 VID=0cf3 PID=1006
 LOG=/var/log/ath9k-watchdog.log
 CHECK_INTERVAL=5          # seconds between checks
@@ -146,13 +148,17 @@ recover() { # $1=reason
 
 # ---- one check -------------------------------------------------------------
 check_once() {
+	# resolve the iface every check: empty until the adapter enumerates,
+	# and ATH9K_IFACE wins when set (selftest pins it to lo)
+	IFACE="${ATH9K_IFACE:-$(ls /sys/class/net/ 2>/dev/null | grep '^wlx' | head -1)}"
 	# v4.2: re-derive the gateway EVERY check — the DHCP subnet can change
-	# mid-run (live case 2026-11-15: 10.64.17.158 -> 172.17.235.167 after an
-	# AP reconfig); a cached target turned a healthy link into "permanent fail".
+	# mid-run (live case 2026-11-15: the LAN moved to a different private
+	# /24 after an AP reconfig); a cached target turned a healthy link
+	# into "permanent fail".
 	GW=$(ip route show dev "$IFACE" 2>/dev/null | awk '/^default/ {print $3; exit}')
 	if [ "$MODE" = "--selftest" ]; then GW=192.0.2.1; fi
 
-	if [ ! -d "/sys/class/net/$IFACE" ]; then
+	if [ -z "$IFACE" ] || [ ! -d "/sys/class/net/$IFACE" ]; then
 		MISSING_N=$((MISSING_N + 1))
 		[ "$MISSING_N" -eq 1 ] && log "iface $IFACE missing — waiting (driver reload or replug in progress)"
 		STALL_N=0; SOFT_N=0; LAST_TX=-1; LAST_RX=-1; EPISODE_ALERTED=0
@@ -223,7 +229,7 @@ selftest() {
 	log "SELFTEST start: mode=dryrun iface=fake(lo counters) target=192.0.2.1"
 	# exercise: 3 consecutive stalls -> unbind/bind dry-run -> usbreset dry-run
 	STALL_LIMIT=2 SOFT_LIMIT=4 CHECK_INTERVAL=0
-	IFACE=lo
+	ATH9K_IFACE=lo
 	log "-- phase A: definite stall ladder --"
 	for i in 1 2 3; do check_once; done
 	log "-- phase B: counters moving (association problem) -> NO reset --"
@@ -281,7 +287,7 @@ case "$MODE" in
 	--install) exit 0 ;;
 	--once) check_once ;;
 	--loop)
-		log "watchdog started (iface=$IFACE interval=${CHECK_INTERVAL}s stall_limit=$STALL_LIMIT soft_limit=$SOFT_LIMIT)"
+		log "watchdog started (iface=${ATH9K_IFACE:-auto-detect} interval=${CHECK_INTERVAL}s stall_limit=$STALL_LIMIT soft_limit=$SOFT_LIMIT)"
 		trap 'log "watchdog stopped"; exit 0' INT TERM
 		while true; do check_once; sleep "$CHECK_INTERVAL"; done
 		;;

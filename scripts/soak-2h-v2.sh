@@ -5,7 +5,11 @@
 set -u
 cd "$(dirname "$0")"
 LOG=soak-run2.log
-IFACE=wlxf8d111b37c15
+IFACE=$(ls /sys/class/net/ 2>/dev/null | grep '^wlx' | head -1)
+[ -n "$IFACE" ] || { echo "no wlx* interface found"; exit 1; }
+# USB device node for power/control — resolved via the bound driver, not a fixed path
+USBIF=$(basename "$(ls -d /sys/bus/usb/drivers/ath9k_htc/*:* 2>/dev/null | head -1)")
+USBDEV=${USBIF%%:*}
 GW=""   # auto-discovered each check (subnet can change)
 DUR=7200
 STEP=10
@@ -18,7 +22,7 @@ echo "config snapshot:"
 for f in /sys/module/ath9k_htc/parameters/*; do echo "  $(basename $f)=$(cat $f)"; done
 sudo -n /usr/bin/dmesg | grep -E "Transferred FW|FW Version" | tail -2 | sed 's/^/  /'
 echo "  regdom: $(sudo -n /usr/sbin/iw reg get | head -1)"
-echo "  usb:    $(cat /sys/bus/usb/devices/2-1.1/power/control) $(cat /sys/bus/usb/devices/2-1.1/power/runtime_status)"
+echo "  usb:    $(cat /sys/bus/usb/devices/$USBDEV/power/control 2>/dev/null) $(cat /sys/bus/usb/devices/$USBDEV/power/runtime_status 2>/dev/null)"
 echo "  psave:  $(sudo -n /usr/sbin/iw dev $IFACE get power_save)"
 echo "  dbgmsk: $(sudo -n /usr/bin/cat $D/debug 2>/dev/null)"
 echo "  wd:     $(systemctl is-active ath9k-watchdog.service)"
@@ -54,7 +58,7 @@ while [ $((N * STEP)) -lt $DUR ]; do
 		IFIP=$(ip -4 addr show dev $IFACE 2>/dev/null | grep -o 'inet [0-9.]*' | awk '{print $2}' | head -1)
 		SPD=$(curl --interface "$IFIP" -sS -o /dev/null -w '%{speed_download}' --max-time 90 http://cachefly.cachefly.net/10mb.test 2>/dev/null)
 		echo "  dl: ${SPD:-0} B/s"
-		echo "  usb: $(cat /sys/bus/usb/devices/2-1.1/power/control)/$(cat /sys/bus/usb/devices/2-1.1/power/runtime_status)  wd: $(systemctl is-active ath9k-watchdog.service)"
+		echo "  usb: $(cat /sys/bus/usb/devices/$USBDEV/power/control 2>/dev/null)/$(cat /sys/bus/usb/devices/$USBDEV/power/runtime_status 2>/dev/null)  wd: $(systemctl is-active ath9k-watchdog.service)"
 		NEW=$(sudo -n /usr/bin/dmesg | tail -n +$((DMARK+1)) | grep -icE "timeout|fail|reset|disconnect|wedge")
 		echo "  dmesg new error-lines since start: $NEW"
 		DMARK=$(sudo -n /usr/bin/dmesg | wc -l)

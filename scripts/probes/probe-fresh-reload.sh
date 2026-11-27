@@ -4,8 +4,7 @@
 # cannot grab the interface or scan during the probe window.
 set -u
 [ "$(id -u)" -eq 0 ] || { echo "run with sudo: sudo $0"; exit 1; }
-IFACE=wlxf8d111b37c15
-[ -d "/sys/class/net/$IFACE" ] || IFACE=$(ls /sys/class/net/ | grep '^wlx' | head -1)
+IFACE=$(ls /sys/class/net/ 2>/dev/null | grep '^wlx' | head -1)
 [ -n "$IFACE" ] || { echo "FAIL: no wlx iface"; exit 1; }
 
 echo "== pre-isolate =="

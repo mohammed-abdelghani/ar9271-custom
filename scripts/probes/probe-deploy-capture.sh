@@ -13,8 +13,10 @@ sleep 0.5
 "$B/deploy.sh" 2>&1 | tail -15
 sleep 1
 kill "$MONPID" 2>/dev/null; wait "$MONPID" 2>/dev/null
-echo "=== usbmon: traffic per endpoint (dev on 2-1.2) ==="
-DEVNUM=$(cat /sys/bus/usb/devices/2-1.2/devnum 2>/dev/null || echo "?")
+echo "=== usbmon: traffic per endpoint (dev=$(basename "$(ls -d /sys/bus/usb/drivers/ath9k_htc/*:* 2>/dev/null | head -1)" 2>/dev/null)) ==="
+USBIF=$(basename "$(ls -d /sys/bus/usb/drivers/ath9k_htc/*:* 2>/dev/null | head -1)")
+USBDEV=${USBIF%%:*}
+DEVNUM=$(cat "/sys/bus/usb/devices/$USBDEV/devnum" 2>/dev/null || echo "?")
 python3 - "$DEVNUM" "$MON" <<'EOF'
 import re,sys
 dev,mon=sys.argv[1],sys.argv[2]

@@ -5,17 +5,17 @@
 ### التحقق من وجود الكارت ورفع الواجهة
 
 ```bash
-ip link show wlxf8d111b37c15            # عرض حالة الواجهة
-sudo ip link set wlxf8d111b37c15 up     # رفع الواجهة
+ip link show wlx001122334455            # عرض حالة الواجهة
+sudo ip link set wlx001122334455 up     # رفع الواجهة
 ```
 
 ### الاتصال بشبكة واي فاي (عبر NetworkManager)
 
 ```bash
-nmcli device wifi list ifname wlxf8d111b37c15              # مسح الشبكات المتاحة
+nmcli device wifi list ifname wlx001122334455              # مسح الشبكات المتاحة
 sudo nmcli device wifi connect "اسم الشبكة" \
-     password "كلمة السر" ifname wlxf8d111b37c15           # الاتصال بشبكة
-nmcli device disconnect wlxf8d111b37c15                    # فصل
+     password "كلمة السر" ifname wlx001122334455           # الاتصال بشبكة
+nmcli device disconnect wlx001122334455                    # فصل
 ```
 
 ### فحص جودة الإشارة
@@ -40,18 +40,18 @@ sudo apt install iw aircrack-ng
 sudo systemctl stop NetworkManager wpa_supplicant
 
 # 3) تحويل الكارت إلى Monitor Mode
-sudo ip link set wlxf8d111b37c15 down
-sudo iw dev wlxf8d111b37c15 set type monitor
-sudo ip link set wlxf8d111b37c15 up
+sudo ip link set wlx001122334455 down
+sudo iw dev wlx001122334455 set type monitor
+sudo ip link set wlx001122334455 up
 
 # 4) التحقق
 iw dev                      # يجب أن تظهر Mode: Monitor
-sudo airodump-ng wlxf8d111b37c15
+sudo airodump-ng wlx001122334455
 
 # 5) الرجوع للوضع الطبيعي (Managed)
-sudo ip link set wlxf8d111b37c15 down
-sudo iw dev wlxf8d111b37c15 set type managed
-sudo ip link set wlxf8d111b37c15 up
+sudo ip link set wlx001122334455 down
+sudo iw dev wlx001122334455 set type managed
+sudo ip link set wlx001122334455 up
 sudo systemctl start NetworkManager
 ```
 
@@ -93,9 +93,9 @@ sudo systemctl start NetworkManager
 ### ❌ المشكلة: لا يوجد شبكات تظهر في المسح
 
 ```bash
-sudo ip link set wlxf8d111b37c15 down
-sudo ip link set wlxf8d111b37c15 up
-nmcli device wifi rescan ifname wlxf8d111b37c15
+sudo ip link set wlx001122334455 down
+sudo ip link set wlx001122334455 up
+nmcli device wifi rescan ifname wlx001122334455
 ```
 وإن استمرت المشكلة: أعد تحميل الدرايفَر:
 ```bash
@@ -109,7 +109,7 @@ sudo modprobe -r ath9k_htc && sleep 2 && sudo modprobe ath9k_htc
 | الهدف | الأمر |
 |---|---|
 | وجود الجهاز | `lsusb \| grep 0cf3:1006` |
-| الإنترفيس والدرايفر | `readlink /sys/class/net/wlxf8d111b37c15/device/driver` |
+| الإنترفيس والدرايفر | `readlink /sys/class/net/wlx001122334455/device/driver` |
 | إعادة تحميل الدرايفَر | `sudo modprobe -r ath9k_htc && sudo modprobe ath9k_htc` |
 | الباراميترات | `ls /sys/module/ath9k_htc/parameters/` |
 | حالة الاتصال | `nmcli device status` |

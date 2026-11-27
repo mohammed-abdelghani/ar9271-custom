@@ -43,7 +43,7 @@ thematic record of the whole engineering effort: what was built, how it was debu
 | **Antenna** | External detachable 4 dBi, RP-SMA |
 | **Linux driver** | `ath9k_htc` (in-tree) → custom build v4.1 |
 | **Firmware** | stock `htc_9271-1.4.0.fw` → custom v1.5 (`htc_9271-1.dev.0.fw`, 46 WMI commands) |
-| **Interface here** | `wlxf8d111b37c15` (MAC `f8:d1:11:b3:7c:15`) |
+| **Interface here** | `wlx001122334455` (MAC `00:11:22:33:44:55` — anonymized example values) |
 | **Kernel** | 6.12.117+deb13-amd64 (Debian) |
 
 > 💡 **Don't confuse** this adapter with the **TL-WN722N** — both use the AR9271 and both support monitor mode on Linux,

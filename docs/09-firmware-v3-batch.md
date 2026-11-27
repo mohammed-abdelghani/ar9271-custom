@@ -39,8 +39,8 @@
 ## 🧪 الاختبار (بعد deploy)
 
 ```bash
-sudo /home/mohamed/Projects/ath9k-fw-build/deploy.sh
-sudo /home/mohamed/Projects/ath9k-fw-build/test-all.sh
+sudo ~/ath9k-fw-build/deploy.sh
+sudo ~/ath9k-fw-build/test-all.sh
 ```
 
 ## ⚙️ تفاصيل هندسية

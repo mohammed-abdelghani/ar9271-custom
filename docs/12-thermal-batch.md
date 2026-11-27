@@ -81,8 +81,8 @@
 - **thermal مثبت حياً**: `cap 48` → `effective=48/63` فوراً ✓ و`cap 255` → uncapped ✓ (دلالة 255 كانت unreachable واتصلحت). `avg_rssi` يبقى 0 مع hooks=0 (العينات تعتمد الـ RX hook).
 
 ```bash
-sudo /home/mohamed/Projects/ath9k-fw-build/deploy.sh
-sudo /home/mohamed/Projects/ath9k-fw-build/test-all.sh   # الأقسام 15 — بوابة قبول v3 (rssi_hist) + كل الأوامر
+sudo ~/ath9k-fw-build/deploy.sh
+sudo ~/ath9k-fw-build/test-all.sh   # الأقسام 15 — بوابة قبول v3 (rssi_hist) + كل الأوامر
 
 # القسم الحراري (16) — السقف اليدوي (لا يحتاج hooks):
 D=$(ls -d /sys/kernel/debug/ieee80211/phy*/ath9k_htc | head -1)

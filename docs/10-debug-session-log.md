@@ -48,8 +48,8 @@
 **بناء v3 الكامل (بـ 48 bin) مبني و copied إلى جذر البناء — جاهز للنشر مباشرة:**
 
 ```bash
-sudo /home/mohamed/Projects/ath9k-fw-build/deploy.sh
-sudo /home/mohamed/Projects/ath9k-fw-build/test-all.sh
+sudo ~/ath9k-fw-build/deploy.sh
+sudo ~/ath9k-fw-build/test-all.sh
 ```
 
 **التوقع:** كل الأقسام الـ 15 تستجيب — خصوصاً القسم 4 (`rssi_hist` — الرد 52B الآن تحت الحد).

@@ -34,6 +34,6 @@
 2. **الـ MAC filter يستخدم `adf_nbuf_free`** لإعادة buffer الفريم المرفوض للمجمع — راقب `tgt_rx_stats` أثناء الاستخدام الأول للتأكد من عدم تسريب buffers.
 3. **Auto-ANI يكتب على نفس سجلات `firstep` اليدوي** — لو الاتنين مفعّلين، الفيرموير هو المتحكم. قراءة `firstep` تعرض آخر قيمة.
 4. **ميزانية الذاكرة**: الإضافات ~500 بايت من statics — الـ headroom المتاح كان 4.9KB فقط (مقاس بـ `xtensa-elf-size` على `fw.elf`: data+bss = 117.5KB من 122.4KB). لهذا **أُلغيت فكرة رفع ATH_RXBUF إلى 40** هندسياً (كانت ستحتاج +33KB).
-5. **الاختبار الجماعي:** `sudo /home/mohamed/Projects/ath9k-fw-build/test-all.sh` بعد الـ deploy.
+5. **الاختبار الجماعي:** `sudo ~/ath9k-fw-build/test-all.sh` بعد الـ deploy.
 
 📅 آخر تحديث: 2026-11-14

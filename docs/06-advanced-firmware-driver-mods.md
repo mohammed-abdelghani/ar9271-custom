@@ -42,12 +42,12 @@
 
 ---
 
-## 2️⃣ نظام البناء (`/home/mohamed/Projects/ath9k-fw-build/`)
+## 2️⃣ نظام البناء (`~/ath9k-fw-build/`)
 
 سبب وجود مجلد بناء منفصل: الـ Makefile الأصلي للفيرموير يستخدم `BASEDIR=$(shell pwd)` وينكسر نهائياً مع المسافات في مسار المشروع الأصلي. لذلك:
 
 ```
-/home/mohamed/Projects/ath9k-fw-build/
+~/ath9k-fw-build/
 ├── fw/open-ath9k-htc-firmware/     ← مرآة المصدر (بدون مسافات في المسار)
 ├── driver/ath/                     ← مرآة مصدر الدرايفَر
 ├── ath9k-htc.kbuild                ← Kbuild البناء خارج الشجرة
@@ -80,7 +80,7 @@
 ### 🟢 المرحلة 1 — درايفر مخصص + فيرموير رسمي 1.4.0 (متاح الآن)
 
 ```bash
-sudo /home/mohamed/Projects/ath9k-fw-build/deploy.sh
+sudo ~/ath9k-fw-build/deploy.sh
 ```
 
 السكربت يثبّت الموديول في `/lib/modules/$(uname -r)/updates/` (يظلّل النسخة الرسمية **دون مساسها**) ويعيد التحميل. بما أن الفيرموير المخصص لم يُبنَ بعد، يبقى الرسمي شغالاً — و`use_dev_fw=1` آمن تماماً (الدريفر يرجع لـ 1.4.0 تلقائياً).
@@ -98,8 +98,8 @@ sudo /home/mohamed/Projects/ath9k-fw-build/deploy.sh
 
 عند توفر إنترنت:
 ```bash
-/home/mohamed/Projects/ath9k-fw-build/fw-build.sh   # يستكمل من حيث توقف (يتخطى المكتمل)
-sudo /home/mohamed/Projects/ath9k-fw-build/deploy.sh  # يرفع الفيرموير تلقائياً في فتحة dev
+~/ath9k-fw-build/fw-build.sh   # يستكمل من حيث توقف (يتخطى المكتمل)
+sudo ~/ath9k-fw-build/deploy.sh  # يرفع الفيرموير تلقائياً في فتحة dev
 ```
 ثم أعد بناء الدرايفَر مع رفع `MAX_STA` لـ 16 (الطرفان معاً).
 
@@ -124,7 +124,7 @@ cat /sys/kernel/debug/ieee80211/$PHY/ath9k_htc/tgt_int_stats
 ### الرجوع للخلف
 
 ```bash
-sudo /home/mohamed/Projects/ath9k-fw-build/rollback.sh
+sudo ~/ath9k-fw-build/rollback.sh
 ```
 
 ---

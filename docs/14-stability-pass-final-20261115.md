@@ -48,7 +48,7 @@ At **17:22** the link died for real (ping fail + tx/rx counters **frozen at 0**)
 4. As counters started moving again with ping still failing, it correctly reclassified as "association/link problem — no reset" (no spurious USB resets).
 5. Watchdog v4.2 was written from this event: **NM-reconnect as recovery step 2** (before usbreset), **gateway re-derived every check**, **once-per-episode ALERT logging**.
 
-Network context of the event (infrastructure, not the adapter): the AP was **moved ch11 → ch6 at ~17:05** (both radios re-associated; the adapter survived that channel hop on its own), then during the hang the adapter re-associated to a **different BSSID** (`16:bc:fa:65:41:63`, ch11 — mesh unit) and the whole LAN **changed subnet** (`10.64.17.0/24` → `172.17.235.0/24`, gateway `.167`). After recovery the adapter holds a valid lease and pings the new gateway at 0% loss / ~5 ms.
+Network context of the event (infrastructure, not the adapter): the AP was **moved ch11 → ch6 at ~17:05** (both radios re-associated; the adapter survived that channel hop on its own), then during the hang the adapter re-associated to a **different BSSID** (`02:00:00:00:00:02`, ch11 — mesh unit) and the whole LAN **changed subnet** (`192.0.2.0/24` → `198.51.100.0/24`, gateway `.167`). *(Subnets, gateway and BSSID anonymized to RFC 5737 documentation ranges for publication.)* After recovery the adapter holds a valid lease and pings the new gateway at 0% loss / ~5 ms.
 
 ### 2b) Soak results
 
@@ -104,15 +104,16 @@ sudo systemctl disable --now ath9k-watchdog.service
 sudo rm /etc/systemd/system/ath9k-watchdog.service /var/log/ath9k-watchdog.log
 sudo systemctl daemon-reload
 
-# 6+7. Driver v4.1 (ATH_DEBUG + NF fix) — restore prior sources and rebuild
-cd /home/mohamed/Projects/ath9k-fw-build
-cp ath9k-htc.kbuild.bak.1794752804 ath9k-htc.kbuild
-cp "/home/mohamed/Projects/TP-Link TL-WN422G v2 Qualcomm Atheros AR9271/sources/driver/linux-6.12.116-ath9k/drivers/net/wireless/ath/ath9k/htc_drv_debug.c.bak.1794753465" \
-   "/home/mohamed/Projects/TP-Link TL-WN422G v2 Qualcomm Atheros AR9271/sources/driver/linux-6.12.116-ath9k/drivers/net/wireless/ath/ath9k/htc_drv_debug.c"
+# 6+7. Driver v4.1 (ATH_DEBUG + NF fix) — restore the pre-change sources
+#     (the .bak copies of ath9k-htc.kbuild and htc_drv_debug.c kept next to
+#     the build mirror), then rebuild and redeploy:
+cd ~/ath9k-fw-build
+cp ath9k-htc.kbuild.bak.<timestamp> ath9k-htc.kbuild
+cp /path/to/pre-change/htc_drv_debug.c htc_drv_debug.c   # your backup copy
 ./driver-build.sh && sudo ./deploy.sh   # then reconnect NM
 
-# 8. test-all.sh
-cp /home/mohamed/Projects/ath9k-fw-build/test-all.sh.bak.1794753101 /home/mohamed/Projects/ath9k-fw-build/test-all.sh
+# 8. test-all.sh — restore your previous test-all.sh the same way
+#    (a .bak.<timestamp> copy was kept in the build dir).
 ```
 
 Files kept intentionally: `ath9k-watchdog.sh` and `boot-fw-probe.sh` (the services reference them).
@@ -121,4 +122,4 @@ Files kept intentionally: `ath9k-watchdog.sh` and `boot-fw-probe.sh` (the servic
 
 `/etc/sudoers.d/99-ath9k-diag` — status at end of session: see final chat report (removed / kept, with reason).
 
-📅 Session: 2026-11-15, kernel 6.12.117+deb13-amd64, iface `wlxf8d111b37c15` (0cf3:1006)
+📅 Session: 2026-11-15, kernel 6.12.117+deb13-amd64, iface `wlx001122334455` (0cf3:1006)

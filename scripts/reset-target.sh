@@ -5,14 +5,15 @@
 # RUN WITH: sudo ./reset-target.sh
 set -u
 
-WEDGED=0
-for d in /sys/bus/usb/devices/2-1.*; do
-	[ -f "$d/idVendor" ] || continue
-	if grep -q 0cf3 "$d/idVendor" 2>/dev/null; then
-		DEVP="$d"
-		break
-	fi
-done
+find_target() { # prints the sysfs dir of the 0cf3:xxxx Atheros device
+	for d in /sys/bus/usb/devices/*; do
+		[ -f "$d/idVendor" ] || continue
+		grep -q "^0cf3$" "$d/idVendor" 2>/dev/null && { echo "$d"; return 0; }
+	done
+	return 1
+}
+
+DEVP=$(find_target) || true
 
 if [ -z "${DEVP:-}" ]; then
 	echo "target not found on USB — is the card plugged in?"
@@ -28,10 +29,7 @@ echo 1 > "$DEVP/authorized"
 sleep 3
 
 echo "== 2) re-enumeration check =="
-NEWDEV=$(for d in /sys/bus/usb/devices/2-1.*; do
-	[ -f "$d/idVendor" ] || continue
-	grep -q 0cf3 "$d/idVendor" 2>/dev/null && echo "$d" && break
-done | head -1)
+NEWDEV=$(find_target) || true
 
 if [ -z "$NEWDEV" ]; then
 	echo "FATAL: target did not re-enumerate — physical replug required."
