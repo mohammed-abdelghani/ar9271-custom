@@ -19,7 +19,7 @@ trap 'rm -f "$ERRF" "$ERRP" "$OUT"' EXIT
 
 [ "$(id -u)" -eq 0 ] || { echo "run with sudo: sudo $0"; exit 1; }
 
-IFACE=$(find /sys/class/net -mindepth 1 -maxdepth 1 -type d -name 'wlx*' -printf '%f\n' 2>/dev/null | sort | head -1)
+IFACE=$(find /sys/class/net -mindepth 1 -maxdepth 1 -name 'wlx*' -printf '%f\n' 2>/dev/null | sort | head -1)
 if [ -z "$IFACE" ]; then echo "FAIL: no wlx interface"; exit 1; fi
 N=$(cat "/sys/class/net/$IFACE/phy80211/index")
 D="/sys/kernel/debug/ieee80211/phy$N/ath9k_htc"

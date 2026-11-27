@@ -149,7 +149,7 @@ recover() { # $1=reason
 check_once() {
 	# resolve the iface every check: empty until the adapter enumerates,
 	# and ATH9K_IFACE wins when set (selftest pins it to lo)
-	IFACE="${ATH9K_IFACE:-$(find /sys/class/net -mindepth 1 -maxdepth 1 -type d -name 'wlx*' -printf '%f\n' 2>/dev/null | sort | head -1)}"
+	IFACE="${ATH9K_IFACE:-$(find /sys/class/net -mindepth 1 -maxdepth 1 -name 'wlx*' -printf '%f\n' 2>/dev/null | sort | head -1)}"
 	# v4.2: re-derive the gateway EVERY check — the DHCP subnet can change
 	# mid-run (live case 2026-11-15: the LAN moved to a different private
 	# /24 after an AP reconfig); a cached target turned a healthy link

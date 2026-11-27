@@ -14,7 +14,7 @@
 # RUN WITH: sudo ./test-all.sh
 set -u
 
-IFACE=$(find /sys/class/net -mindepth 1 -maxdepth 1 -type d -name 'wlx*' -printf '%f\n' 2>/dev/null | sort | head -1)
+IFACE=$(find /sys/class/net -mindepth 1 -maxdepth 1 -name 'wlx*' -printf '%f\n' 2>/dev/null | sort | head -1)
 if [ -z "$IFACE" ]; then
 	echo "FATAL: interface missing — replug/reload first"; exit 2
 fi

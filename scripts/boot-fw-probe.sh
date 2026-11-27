@@ -22,7 +22,7 @@ LOG=/var/log/ath9k-boot.log
 			echo "  usb $d control=$(cat "$d/power/control") status=$(cat "$d/power/runtime_status")"
 		fi
 	done
-	IF=$(find /sys/class/net -mindepth 1 -maxdepth 1 -type d -name 'wlx*' -printf '%f\n' 2>/dev/null | sort | head -1)
+	IF=$(find /sys/class/net -mindepth 1 -maxdepth 1 -name 'wlx*' -printf '%f\n' 2>/dev/null | sort | head -1)
 	[ -n "$IF" ] && echo "  wifi power_save: $(iw dev "$IF" get power_save 2>/dev/null)"
 	echo "==============================================================="
 	echo
