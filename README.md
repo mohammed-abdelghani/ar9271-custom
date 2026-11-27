@@ -54,8 +54,7 @@ flowchart LR
 │   ├── 01…04   hardware · stock driver/firmware · device status · usage
 │   ├── 06…09   custom build pipeline · feature roadmap · firmware batches v2/v3
 │   ├── 10…14   debug log · host tuning · thermal batch · WMI-wedge root cause · final stability pass
-│   ├── 15…16   AR9271 chip diagrams (EN / AR, Mermaid)
-│   └── test-final-20261115.log   final test-suite evidence
+│   └── 15…16   AR9271 chip diagrams (EN / AR, Mermaid)
 ├── patches/                      ← the delta vs upstream, as plain diffs (for applying to pristine trees)
 │   ├── ath9k-driver-v6.12.116-custom.patch        driver mods incl. v4.1 (ATH_DEBUG + NF mask fix)
 │   └── open-ath9k-htc-firmware-custom.patch       firmware mods: 13 features + 64B-wedge fixes
@@ -73,6 +72,11 @@ flowchart LR
     └── udev/91-ath9k-htc-stability.rules
 ```
 
+> **Note:** `sources/` contains **upstream code** — the Linux kernel `ath9k` driver subtree (kernel.org
+> v6.12.116) and [open-ath9k-htc-firmware](https://github.com/qca/open-ath9k-htc-firmware) — kept at their
+> original paths under their original licenses. The project delta is in `patches/`; see
+> [sources/README.md](sources/README.md).
+
 ## 🚀 Quick start
 
 > ℹ️ The trees under `sources/` are **already patched and proven on hardware** — you don't need to apply
@@ -88,11 +92,13 @@ flowchart LR
 # 1) build (reads sources/ inside this repo)
 ./scripts/build/driver-build.sh      # → ath9k_htc.ko + ath9k_common.ko (spectral enabled)
 ./scripts/build/fw-build.sh          # → builds the Xtensa toolchain, then htc_9271.fw
-                                     #   (first run ~15 min; or skip: flash firmware/htc_9271-1.dev.0.fw)
+                                     #   (first run ~30-70 min — Xtensa toolchain build;
+                                     #    or skip: flash firmware/htc_9271-1.dev.0.fw)
 
 # 2) deploy + verify (root; installs into /lib/modules/.../updates/ + the dev fw slot)
 sudo ./scripts/deploy.sh
-sudo ./scripts/test-all.sh           # expect: 51 PASS / 2 documented FAILs (ack_timeout readback, idle NF)
+sudo ./scripts/test-all.sh           # expect: 51 PASS / 2 documented FAILs (the two ack_timeout
+                                     #   readback checks — the platform rewrites register 0x8014)
 
 # 3) host-side resilience (udev rule, NM powersave off, regdom, boot probe, watchdog service)
 sudo ./scripts/apply-stability-tuning.sh
@@ -154,9 +160,14 @@ regulatory limits — the docs deliberately treat power above the calibrated def
 مخرجات البناء بتروح mirror فضاؤه خالي (`BUILD_DIR` env، الافتراضي `~/ath9k-fw-build`) لأن Makefile
 الفيرموير يبوظ مع المسارات اللي فيها مسافات.
 
+> **ملاحظة:** مجلد `sources/` فيه **كود upstream** — درايفر `ath9k` من شجرة النواة (kernel.org v6.12.116)
+> ومشروع [open-ath9k-htc-firmware](https://github.com/qca/open-ath9k-htc-firmware) — محفوظين بمساراتهم
+> الأصلية وتراخيصهم الأصلية. تعديلات المشروع موجودة في `patches/` — التفاصيل في
+> [sources/README.md](sources/README.md).
+
 ```bash
 ./scripts/build/driver-build.sh      # → ath9k_htc.ko + ath9k_common.ko (spectral مفعّل)
-./scripts/build/fw-build.sh          # يبني toolchain Xtensa + الفيرموير (أول مرة ~15 دقيقة)
+./scripts/build/fw-build.sh          # يبني toolchain Xtensa + الفيرموير (أول مرة ~30-70 دقيقة)
 sudo ./scripts/deploy.sh && sudo ./scripts/test-all.sh     # المتوقع: 51 PASS / 2 FAIL موثقين
 sudo ./scripts/apply-stability-tuning.sh                   # udev + powersave + regdom + watchdog
 ```

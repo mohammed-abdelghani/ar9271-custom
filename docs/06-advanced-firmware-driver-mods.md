@@ -36,7 +36,7 @@
 
 ### ج) فحص مسار RX للفلترة (بدون تعديل — تم التحقق)
 
-- الدرايفَر يضبط فلتر الـ PCU صح في وضع المونيتور: [`htc_drv_txrx.c:882`](../sources/driver/linux-6.12.116-ath9k/drivers/net/wireless/ath/ath9k/htc_drv_txrx.c) — `is_monitoring → ATH9K_RX_FILTER_PROM`، والقيمة تُكتب في الشريحة عبر WMI REG WRITE.
+- الدرايفَر يضبط فلتر الـ PCU صح في وضع المونيتور: [`htc_drv_txrx.c:882`](../sources/linux-6.12.116-ath9k/drivers/net/wireless/ath/ath9k/htc_drv_txrx.c) — `is_monitoring → ATH9K_RX_FILTER_PROM`، والقيمة تُكتب في الشريحة عبر WMI REG WRITE.
 - نداء `ah_setRxFilter(ah, 0)` في الفيرموير (`if_ath.c:1646`) يحدث فقط في `ath_stoprecv_tgt` (إيقاف الاستقبال) — سلوك سليم.
 - **الخطوة التالية المحتملة** في الفيرموير (إن أردت تعميق الاستقبال): رفع `ATH_RXBUF` (20) في `wlan_cfg.h` — يجرب **بعد** التأكد من ميزانية الذاكرة في الـ linker لأن جدول العقد اتضاعف بالفعل.
 

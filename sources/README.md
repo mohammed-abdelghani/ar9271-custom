@@ -9,7 +9,7 @@ The delta against pristine upstream is also recorded as plain diffs in [`../patc
 | Tree | Upstream origin | Size | Contents |
 |---|---|---|---|
 | `linux-6.12.116-ath9k/` | [kernel.org](https://kernel.org) **v6.12.116** tarball (extracted) | 5.3 MB | only `drivers/net/wireless/ath/` — the subtree the out-of-tree build needs (`ath.h`, `regd.*`, `ath9k/`, …). The rest of the kernel tree is intentionally not included |
-| `open-ath9k-htc-firmware/` | [qca/open-ath9k-htc-firmware](https://github.com/qca/open-ath9k-htc-firmware) (master clone, 2026-11-13) | 21 MB | full firmware tree: `target_firmware/` (our build lives here), `sboot/`, `v2/`, docs, licences |
+| `open-ath9k-htc-firmware/` | [qca/open-ath9k-htc-firmware](https://github.com/qca/open-ath9k-htc-firmware) (master clone, 2026-11-13) | 6.2 MB | full firmware tree: `target_firmware/` (our build lives here), `sboot/`, `v2/`, docs, licences |
 
 **Excluded from both trees (deliberately):** upstream `.git` metadata, the Xtensa toolchain download
 (`toolchain/dl` — fetched + sha256-verified by the build script), and build artifacts.

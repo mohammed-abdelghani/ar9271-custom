@@ -27,7 +27,7 @@ thematic record of the whole engineering effort: what was built, how it was debu
 | 14 | [14-stability-pass-final-20261115.md](14-stability-pass-final-20261115.md) | EN | 📋 Final stability pass — changes table, measurements, soak, revert instructions |
 | 15 | [15-chip-diagrams-en.md](15-chip-diagrams-en.md) | EN | 🧩 AR9271 chip diagrams (Mermaid): SoC blocks, USB endpoint map, TX/RX paths, WMI flow, memory map |
 | 16 | [16-chip-diagrams-ar.md](16-chip-diagrams-ar.md) | AR | 🧩 نفس المخططات بالعربية |
-| — | [test-final-20261115.log](test-final-20261115.log) | — | Final `test-all.sh` output (the 51 PASS evidence) |
+| — | `test-final-20261115.log` *(raw log — not distributed)* | — | Final suite result is recorded in [14](14-stability-pass-final-20261115.md) |
 
 > ℹ️ **Numbering note:** no `05` exists — that document was consolidated into `06` early in the project.
 > Original numbering is preserved to keep all internal cross-references (e.g. "docs/13") valid.
