@@ -3,9 +3,9 @@
 # Logs to soak-run2.log: per-10s ping, per-5min load/metrics blocks, final summary.
 # Watchdog (ath9k-watchdog.service) runs alongside; its triggers are counted here.
 set -u
-cd "$(dirname "$0")"
+cd "$(dirname "$0")" || exit 1
 LOG=soak-run2.log
-IFACE=$(ls /sys/class/net/ 2>/dev/null | grep '^wlx' | head -1)
+IFACE=$(find /sys/class/net -mindepth 1 -maxdepth 1 -type d -name 'wlx*' -printf '%f\n' 2>/dev/null | sort | head -1)
 [ -n "$IFACE" ] || { echo "no wlx* interface found"; exit 1; }
 # USB device node for power/control — resolved via the bound driver, not a fixed path
 USBIF=$(basename "$(ls -d /sys/bus/usb/drivers/ath9k_htc/*:* 2>/dev/null | head -1)")

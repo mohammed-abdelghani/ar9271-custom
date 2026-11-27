@@ -14,7 +14,7 @@ MON=/tmp/usbmon-capture.txt
 # 1) fresh load, NM isolated
 "$B/probe-fresh-reload.sh" || exit 1
 
-IFACE=$(ls /sys/class/net/ 2>/dev/null | grep '^wlx' | head -1)
+IFACE=$(find /sys/class/net -mindepth 1 -maxdepth 1 -type d -name 'wlx*' -printf '%f\n' 2>/dev/null | sort | head -1)
 [ -n "$IFACE" ] || { echo "FAIL: no wlx iface"; exit 1; }
 N=$(cat "/sys/class/net/$IFACE/phy80211/index")
 D="/sys/kernel/debug/ieee80211/phy$N/ath9k_htc"

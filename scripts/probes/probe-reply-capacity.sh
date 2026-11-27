@@ -11,7 +11,7 @@
 # RUN WITH:  sudo deploy.sh   (fresh fw load!)   then:  sudo ./probe-reply-capacity.sh
 set -u
 
-IFACE=$(ls /sys/class/net/ | grep '^wlx' | head -1)
+IFACE=$(find /sys/class/net -mindepth 1 -maxdepth 1 -type d -name 'wlx*' -printf '%f\n' 2>/dev/null | sort | head -1)
 [ -z "$IFACE" ] && { echo "interface missing — replug/reload first"; exit 1; }
 D=/sys/kernel/debug/ieee80211/phy$(cat "/sys/class/net/$IFACE/phy80211/index")/ath9k_htc
 

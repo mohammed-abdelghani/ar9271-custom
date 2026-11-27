@@ -27,7 +27,6 @@ set -uo pipefail
 # iface is auto-detected each check (wlx* = wlx + the adapter's USB MAC);
 # override with ATH9K_IFACE=wlx... if several wlx interfaces exist
 IFACE="${ATH9K_IFACE:-}"
-VID=0cf3 PID=1006
 LOG=/var/log/ath9k-watchdog.log
 CHECK_INTERVAL=5          # seconds between checks
 STALL_LIMIT=3             # consecutive definite-stall checks before recovery (~15-20s)
@@ -85,7 +84,7 @@ recover() { # $1=reason
 		sysfs_write /sys/bus/usb/drivers/ath9k_htc/unbind "$IFACEDEV"
 		sleep 2
 		sysfs_write /sys/bus/usb/drivers/ath9k_htc/bind "$IFACEDEV"
-		for i in $(seq 1 8); do
+		for _ in $(seq 1 8); do
 			[ -d "/sys/class/net/$IFACE" ] && break; sleep 1
 		done
 	fi
@@ -104,7 +103,7 @@ recover() { # $1=reason
 		sleep 2
 		nmcli device connect "$IFACE" >/dev/null 2>&1 || true
 	fi
-	for i in $(seq 1 20); do
+	for _ in $(seq 1 20); do
 		do_ping "$IFACE" && break; sleep 1
 	done
 	if do_ping "$IFACE"; then
@@ -118,7 +117,7 @@ recover() { # $1=reason
 	if [ -n "$BUSNUM" ] && [ -n "$DEVNUM" ]; then
 		log "recovery step 3: usbreset /dev/bus/usb/$(printf '%03d' "$BUSNUM")/$(printf '%03d' "$DEVNUM")"
 		if [ "$DRYRUN" = "1" ]; then log "DRYRUN: usbreset skipped"; else /usr/bin/usbreset "/dev/bus/usb/$(printf '%03d' "$BUSNUM")/$(printf '%03d' "$DEVNUM")" >> "$LOG" 2>&1 || log "usbreset returned rc=$?"; fi
-		for i in $(seq 1 30); do
+		for _ in $(seq 1 30); do
 			[ -d "/sys/class/net/$IFACE" ] && sleep 2 && break; sleep 1
 		done
 	else
@@ -131,7 +130,7 @@ recover() { # $1=reason
 		# after a USB reset NM usually re-probes; give DHCP a window, then judge
 		sleep 10
 		if [ "$DRYRUN" != "1" ]; then nmcli device connect "$IFACE" >/dev/null 2>&1 || true; fi
-		for i in $(seq 1 15); do
+		for _ in $(seq 1 15); do
 			do_ping "$IFACE" && break; sleep 1
 		done
 		if do_ping "$IFACE"; then
@@ -150,7 +149,7 @@ recover() { # $1=reason
 check_once() {
 	# resolve the iface every check: empty until the adapter enumerates,
 	# and ATH9K_IFACE wins when set (selftest pins it to lo)
-	IFACE="${ATH9K_IFACE:-$(ls /sys/class/net/ 2>/dev/null | grep '^wlx' | head -1)}"
+	IFACE="${ATH9K_IFACE:-$(find /sys/class/net -mindepth 1 -maxdepth 1 -type d -name 'wlx*' -printf '%f\n' 2>/dev/null | sort | head -1)}"
 	# v4.2: re-derive the gateway EVERY check — the DHCP subnet can change
 	# mid-run (live case 2026-11-15: the LAN moved to a different private
 	# /24 after an AP reconfig); a cached target turned a healthy link
@@ -231,17 +230,17 @@ selftest() {
 	STALL_LIMIT=2 SOFT_LIMIT=4 CHECK_INTERVAL=0
 	ATH9K_IFACE=lo
 	log "-- phase A: definite stall ladder --"
-	for i in 1 2 3; do check_once; done
+	for _ in 1 2 3; do check_once; done
 	log "-- phase B: counters moving (association problem) -> NO reset --"
 	echo 1050 > "$STALL_INJ"
 	STALL_N=0; SOFT_N=0; LAST_TX=1049; LAST_RX=5000
 	check_once
 	log "-- phase C: counters static again -> recovery resumes --"
 	echo 1050 > "$STALL_INJ"; LAST_TX=1050; LAST_RX=5000
-	for i in 1 2; do check_once; done
+	for _ in 1 2; do check_once; done
 	log "-- phase D: rate limit: after MAX_RECOVERIES the next trigger must be refused --"
 	NOW=$(date +%s)
-	for i in 1 2 3; do echo "$NOW" >> /run/ath9k-watchdog.rec.test; done
+	for _ in 1 2 3; do echo "$NOW" >> /run/ath9k-watchdog.rec.test; done
 	cp /run/ath9k-watchdog.rec.test /run/ath9k-watchdog.rec 2>/dev/null
 	recover "selftest rate-limit check"
 	rm -f /run/ath9k-watchdog.rec /run/ath9k-watchdog.rec.test "$STALL_INJ"

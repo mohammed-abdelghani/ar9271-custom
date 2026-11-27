@@ -4,7 +4,7 @@
 # cannot grab the interface or scan during the probe window.
 set -u
 [ "$(id -u)" -eq 0 ] || { echo "run with sudo: sudo $0"; exit 1; }
-IFACE=$(ls /sys/class/net/ 2>/dev/null | grep '^wlx' | head -1)
+IFACE=$(find /sys/class/net -mindepth 1 -maxdepth 1 -type d -name 'wlx*' -printf '%f\n' 2>/dev/null | sort | head -1)
 [ -n "$IFACE" ] || { echo "FAIL: no wlx iface"; exit 1; }
 
 echo "== pre-isolate =="
@@ -17,7 +17,7 @@ sleep 1
 modprobe ath9k_htc use_dev_fw=1 && echo "loaded with use_dev_fw=1"
 
 UP=0
-for i in $(seq 1 40); do
+for _ in $(seq 1 40); do
 	if [ -d "/sys/class/net/$IFACE" ]; then UP=1; break; fi
 	sleep 0.5
 done

@@ -41,7 +41,7 @@ echo "== 3) deploy =="
 bash "$(cd "$(dirname "$0")" && pwd)/deploy.sh"
 
 echo "== 4) focused verification =="
-IFACE=$(ls /sys/class/net/ | grep '^wlx' | head -1)
+IFACE=$(find /sys/class/net -mindepth 1 -maxdepth 1 -type d -name 'wlx*' -printf '%f\n' 2>/dev/null | sort | head -1)
 if [ -z "$IFACE" ]; then
 	echo "interface still missing — check: dmesg | tail -30"
 	exit 1

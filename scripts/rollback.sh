@@ -5,7 +5,7 @@
 set -euo pipefail
 
 KVER=$(uname -r)
-IFACE=$(ls /sys/class/net/ 2>/dev/null | grep '^wlx' | head -1)
+IFACE=$(find /sys/class/net -mindepth 1 -maxdepth 1 -type d -name 'wlx*' -printf '%f\n' 2>/dev/null | sort | head -1)
 
 [ "$(id -u)" -eq 0 ] || { echo "Run with sudo: sudo $0"; exit 1; }
 

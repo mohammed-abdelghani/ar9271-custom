@@ -21,14 +21,14 @@ KVER=$(uname -r)
 B="${BUILD_DIR:-$HOME/ath9k-fw-build}"
 # default iface: auto-detect the wlx* interface (wlx + the adapter's USB MAC —
 # constant for a given physical stick); override with:  sudo IFACE=wlx... ./deploy.sh
-IFACE="${IFACE:-$(ls /sys/class/net/ 2>/dev/null | grep '^wlx' | head -1)}"
+IFACE="${IFACE:-$(find /sys/class/net -mindepth 1 -maxdepth 1 -type d -name 'wlx*' -printf '%f\n' 2>/dev/null | sort | head -1)}"
 
 [ "$(id -u)" -eq 0 ] || { echo "FATAL: run with sudo: sudo $0"; exit 2; }
 [ -f "$B/ath9k_htc.ko" ] || { echo "FATAL: missing $B/ath9k_htc.ko (run driver-build.sh first)"; exit 2; }
 
 nm_isolate() {
 	# the iface may not exist yet (module not loaded) — resolve lazily
-	[ -z "$IFACE" ] && IFACE=$(ls /sys/class/net/ 2>/dev/null | grep '^wlx' | head -1)
+	[ -z "$IFACE" ] && IFACE=$(find /sys/class/net -mindepth 1 -maxdepth 1 -type d -name 'wlx*' -printf '%f\n' 2>/dev/null | sort | head -1)
 	[ -z "$IFACE" ] && { echo "-- no wlx* interface yet, skipping NM isolation"; return 0; }
 	nmcli device set "$IFACE" managed no >/dev/null 2>&1 \
 		&& echo "-- NM unmanaged on $IFACE" \
@@ -63,8 +63,8 @@ nm_isolate   # re-assert: NM must not grab the fresh interface either
 
 echo "== 4) verification (waiting up to 15s for the interface) =="
 UP=0
-for i in $(seq 1 30); do
-	[ -z "$IFACE" ] && IFACE=$(ls /sys/class/net/ 2>/dev/null | grep '^wlx' | head -1)
+for _ in $(seq 1 30); do
+	[ -z "$IFACE" ] && IFACE=$(find /sys/class/net -mindepth 1 -maxdepth 1 -type d -name 'wlx*' -printf '%f\n' 2>/dev/null | sort | head -1)
 	if [ -n "$IFACE" ] && [ -d "/sys/class/net/$IFACE" ]; then UP=1; break; fi
 	sleep 0.5
 done
@@ -83,7 +83,7 @@ fi
 
 echo "== 5) settle: WMI control path must answer (custom ping round trip) =="
 SETTLE=0
-for i in $(seq 1 10); do
+for _ in $(seq 1 10); do
 	# keep NM away while settling
 	nmcli device set "$IFACE" managed no >/dev/null 2>&1 || true
 	if echo "$((RANDOM))" > "$D/custom_ping" 2>/dev/null; then SETTLE=1; break; fi

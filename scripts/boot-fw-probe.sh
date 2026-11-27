@@ -13,7 +13,7 @@ LOG=/var/log/ath9k-boot.log
 		[ -r "$f" ] && echo "  $(basename "$f") = $(cat "$f")"
 	done
 	echo "--- installed firmware files ---"
-	ls -la /lib/firmware/ath9k_htc/ 2>/dev/null | grep htc_9271
+	ls -la /lib/firmware/ath9k_htc/htc_9271* 2>/dev/null
 	echo "--- regulatory ---"
 	iw reg get 2>/dev/null | head -2
 	echo "--- runtime power state ---"
@@ -22,7 +22,7 @@ LOG=/var/log/ath9k-boot.log
 			echo "  usb $d control=$(cat "$d/power/control") status=$(cat "$d/power/runtime_status")"
 		fi
 	done
-	IF=$(ls /sys/class/net | grep -E "^wlx" | head -1)
+	IF=$(find /sys/class/net -mindepth 1 -maxdepth 1 -type d -name 'wlx*' -printf '%f\n' 2>/dev/null | sort | head -1)
 	[ -n "$IF" ] && echo "  wifi power_save: $(iw dev "$IF" get power_save 2>/dev/null)"
 	echo "==============================================================="
 	echo
