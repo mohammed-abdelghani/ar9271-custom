@@ -212,7 +212,7 @@ regulatory limits — the docs deliberately treat power above the calibrated def
 
 ---
 
-# 🇦🇷 القسم العربي
+# القسم العربي
 
 # درايفر وفيرموير مخصصان — TP-Link TL-WN422G v2 (Atheros AR9271)
 
