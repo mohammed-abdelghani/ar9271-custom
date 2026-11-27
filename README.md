@@ -77,6 +77,18 @@ flowchart LR
 > original paths under their original licenses. The project delta is in `patches/`; see
 > [sources/README.md](sources/README.md).
 
+## ⚠️ Safety and disclaimer
+
+- **This modifies hardware-facing firmware and a kernel driver.** A bad flash, a wedge, or an incompatible
+  build can leave the adapter unresponsive — docs/13 and docs/10 document cases where only a physical
+  replug (or a full driver reload) recovered the target.
+- **Provided as-is, no warranty.** The work is GPL-2.0 (see [LICENSE](LICENSE)); the usual "no
+  warranty, use at your own risk" applies. It was tested **only** on the hardware and kernel listed in
+  tested **only** on the hardware and kernel listed in the *Tested on / compatibility* table below.
+- **Always keep a way back.** `scripts/rollback.sh` restores the stock driver + firmware, and
+  [docs/14 §5](docs/14-stability-pass-final-20261115.md) has exact revert instructions for every
+  host-side change. Read [docs/13](docs/13-wmi-wedge-root-cause.md) before touching the WMI paths.
+
 ## 🚀 Quick start
 
 > ℹ️ The trees under `sources/` are **already patched and proven on hardware** — you don't need to apply
@@ -113,6 +125,55 @@ sudo cat $D/blackbox           # last 16 in-chip events
 sudo cat $D/custom_ping        # WMI round-trip sanity
 ```
 
+## ✅ Tested on / compatibility
+
+| Component | Status | Source |
+|---|---|---|
+| Adapter | TP-Link **TL-WN422G v2** (USB `0cf3:1006`, "ATHEROS USB2.0 WLAN") — tested | [docs/01](docs/01-hardware-specs.md), [docs/03](docs/03-current-device-status.md) |
+| Same chipset | TP-Link **TL-WN722N** (also AR9271) — *untested in this repo*; docs note both negotiate 11n rates | [docs/README](docs/README.md) |
+| Wireless | 2.4 GHz 802.11b/g + 802.11n HT20 (MCS 0-7); HT40 capable but *untested* (test AP ran 20 MHz) | [docs/07](docs/07-feature-port-roadmap.md), [docs/14](docs/14-stability-pass-final-20261115.md) |
+| Kernel | 6.12.x — built against 6.12.116 headers, runtime-verified on 6.12.117+deb13-amd64 | [docs/11](docs/11-host-side-stability-tuning.md), [docs/14](docs/14-stability-pass-final-20261115.md) |
+| Distro / userspace | Debian 13 (deb13), NetworkManager, `iw`, `usbutils`, `rsync`, `curl`, `bc` | [docs/03](docs/03-current-device-status.md), [docs/14](docs/14-stability-pass-final-20261115.md) |
+| USB | USB 2.0 port (docs recommend USB 2.0 over 3.0 for 2.4 GHz interference) | [docs/04](docs/04-usage-and-troubleshooting.md) |
+
+## 🔍 Quick verification
+
+```bash
+# firmware actually loaded (dev slot, not stock 1.4.0)
+dmesg | grep -E "Transferred FW|FW Version" | tail -3     # expect htc_9271-1.dev.0.fw / FW Version: 1.5
+cat /sys/module/ath9k_htc/parameters/use_dev_fw            # expect 1
+
+# driver knobs live (debugfs must be mounted)
+ls /sys/kernel/debug/ieee80211/phy*/ath9k_htc | head -30   # custom_ping, blackbox, thermal, ...
+
+# WMI round-trip through the custom command path
+D=/sys/kernel/debug/ieee80211/phy$(cat /sys/class/net/wl*/phy80211/index)/ath9k_htc
+echo 1234 | sudo tee $D/custom_ping && cat $D/custom_ping  # pings=1, pong=1
+
+# full acceptance suite: expect 51 PASS / 2 documented FAILs (ack_timeout readback)
+sudo ./scripts/test-all.sh
+```
+
+## ⚠️ Known limitations
+
+- **`ack_timeout` cannot hold its value** — mac80211 and the ROM shadow rewrite register `0x8014` on every
+  wake; this is the source of the 2 documented test FAILs. Deliberately out of scope for short-range links
+  ([docs/13](docs/13-wmi-wedge-root-cause.md), [docs/14](docs/14-stability-pass-final-20261115.md)).
+- **WMI wire limit** — any control packet of *exactly 64 B* on EP3 wedges the USB controller; all custom
+  replies are capped below that. New WMI features must respect the limit ([docs/13](docs/13-wmi-wedge-root-cause.md)).
+- **HT40 untested** — the test AP operated 20 MHz only; 20 MHz is also the stability-preferred mode
+  ([docs/14](docs/14-stability-pass-final-20261115.md)).
+- **Fixed TX power unsupported** — `iw set txpower fixed` never reaches the hardware; there is no
+  ath9k_htc TX-power apply path outside channel config ([docs/14](docs/14-stability-pass-final-20261115.md)).
+- **`custom_rx_hooks` defaults to 0** — enabling the RX hooks re-produced the wedge signature in testing;
+  they remain a runtime Bisect tool, not a default ([docs/12](docs/12-thermal-batch.md)).
+- **`thermal avg_rssi` reads 0 with hooks off** — RSSI sampling depends on the RX hook path
+  ([docs/14 §4](docs/14-stability-pass-final-20261115.md)).
+- **Boot-time firmware persistence** was verified by config, not yet by a reboot at publication time —
+  see [docs/14 §3](docs/14-stability-pass-final-20261115.md).
+- **Occasional RTT spikes (35–372 ms, no loss)** appear in every configuration; judged environmental
+  (shared channel), unresolved ([docs/14 §4](docs/14-stability-pass-final-20261115.md)).
+
 ## 🔑 Key findings (the parts you won't find upstream)
 
 1. **The 64-byte WMI wedge** — a WMI control packet of *exactly* 64 B total on EP3 reaches the host successfully,
@@ -124,6 +185,19 @@ sudo cat $D/custom_ping        # WMI round-trip sanity
    every wake, so per-knob persistence needs power-save off at minimum, and some knobs simply cannot hold.
 4. **Memory budget discipline** — every firmware feature is measured against the ~3.7 KB IRAM margin
    (`.text` 35,467 B of 39,744 B); feature design starts from the byte budget.
+
+## 🙏 Credits and upstream
+
+- **[open-ath9k-htc-firmware](https://github.com/qca/open-ath9k-htc-firmware)** (Qualcomm Atheros) — the
+  upstream firmware tree under `sources/open-ath9k-htc-firmware/` (mixed licensing: Qualcomm Atheros code
+  under ClearBSD, Tensilica `xtos` under MIT, some ECOS files under GPLv2 with caveats — see its
+  `LICENCE.TXT`/`NOTICE.TXT`/`README`).
+- **Linux kernel `ath9k`/`ath9k_htc`** — the upstream driver subtree under
+  `sources/linux-6.12.116-ath9k/` (GPL-2.0, kernel.org v6.12.116).
+- **This project's work** = the delta in `patches/` and the already-patched trees in `sources/`:
+  13 firmware-resident features, the 64-byte WMI wedge fix, driver debugfs instrumentation, the NF
+  decode fix, and the host-side tooling in `scripts/`. See [sources/README.md](sources/README.md) for
+  the per-file modification manifest.
 
 ## ⚠️ Responsible use
 
@@ -152,6 +226,18 @@ regulatory limits — the docs deliberately treat power above the calibrated def
 | [docs/13](docs/13-wmi-wedge-root-cause.md) | 🎯 السبب الجذري المحسوم بالدليل: حزم WMI بطول 64 بايت-تماماً تعلق متحكم USB |
 | [docs/14](docs/14-stability-pass-final-20261115.md) | 📋 جولة الاستقرار النهائية: جدول تغييرات، قياسات، تعليمات تراجع دقيقة |
 
+## ⚠️ إخلاء المسؤولية والسلامة
+
+- **الشغل ده بيعدّل فيرموير بيشتغل على العتاد ودرايفر كيرنل.** فلاش غلط أو wedge أو بناء غير متوافق
+  ممكن يخلّي المحوّل مش بيرد — docs/13 وdocs/10 موثّقين حالات كان الحل الوحيد فيها فكّ فيزيائي
+  للبطارية أو إعادة تحميل كاملة للدرايفر.
+- **متاح كما هو، بدون ضمان.** الشغل مرخّص GPL-2.0 (انظر [LICENSE](LICENSE))؛ والقاعدة المعتادة
+  "بدون ضمان، الاستخدام على مسؤوليتك" هي اللي شغّالة. اتختبر **فقط** على العتاد والنواة المذكورين
+  في جدول *التوافقية والأجهزة المختبَرة* تحت.
+- **دايماً سيبلك طريق للرجوع.** `scripts/rollback.sh` بيرجّع الدرايفر والفيرموير الأصليين، و
+  [docs/14 §5](docs/14-stability-pass-final-20261115.md) فيه تعليمات تراجع دقيقة لكل تغيير على
+  جانب الجهاز. اقرأ [docs/13](docs/13-wmi-wedge-root-cause.md) قبل ما تلمس مسارات WMI.
+
 ## 🚀 البداية السريعة
 
 المتطلبات: لينكس مع هيدرات النواة (`linux-headers-$(uname -r)`، اختُبرت 6.12.x). شجرة `sources/`
@@ -174,6 +260,70 @@ sudo ./scripts/apply-stability-tuning.sh                   # udev + powersave + 
 
 جرّب الميزات: `sudo cat $D/blackbox` و `sudo cat $D/thermal` و `sudo cat $D/custom_ping` —
 والتفاصيل خطوة بخطوة في [docs/06](docs/06-advanced-firmware-driver-mods.md).
+
+## ✅ التوافقية والأجهزة المختبَرة
+
+| العنصر | الحالة | المصدر |
+|---|---|---|
+| المحوّل | TP-Link **TL-WN422G v2** (USB `0cf3:1006`, "ATHEROS USB2.0 WLAN") — مختبَر | [docs/01](docs/01-hardware-specs.md), [docs/03](docs/03-current-device-status.md) |
+| نفس الشريحة | TP-Link **TL-WN722N** (نفس AR9271) — *غير مختبَر في الريبو ده*؛ الوثائق بتقول إن الاتنين بيتفاوضوا على معدلات 11n | [docs/README](docs/README.md) |
+| اللاسلكي | 2.4 GHz‏ 802.11b/g + 802.11n HT20 (MCS 0-7)؛ HT40 قادر عليه لكن *غير مختبَر* (الـ AP وقت الاختبار كان 20 MHz) | [docs/07](docs/07-feature-port-roadmap.md), [docs/14](docs/14-stability-pass-final-20261115.md) |
+| الكيرنل | 6.12.x — البناء على هيدرات 6.12.116، والتشغيل اتأكد على 6.12.117+deb13-amd64 | [docs/11](docs/11-host-side-stability-tuning.md), [docs/14](docs/14-stability-pass-final-20261115.md) |
+| التوزيعة / المستخدمون | Debian 13 (deb13)، NetworkManager، `iw`، `usbutils`، `rsync`، `curl`، `bc` | [docs/03](docs/03-current-device-status.md), [docs/14](docs/14-stability-pass-final-20261115.md) |
+| USB | منفذ USB 2.0 (الوثائق بتنصح بـ USB 2.0 بدل 3.0 عشان تداخل 2.4 GHz) | [docs/04](docs/04-usage-and-troubleshooting.md) |
+
+## 🔍 تحقق سريع
+
+```bash
+# الفيرموير المحمّل فعلاً (فتحة dev مش الرسمي 1.4.0)
+dmesg | grep -E "Transferred FW|FW Version" | tail -3     # المتوقع: htc_9271-1.dev.0.fw / FW Version: 1.5
+cat /sys/module/ath9k_htc/parameters/use_dev_fw            # المتوقع: 1
+
+# مفاتيح الدرايفر شغالة (لازم debugfs يكون مركّب)
+ls /sys/kernel/debug/ieee80211/phy*/ath9k_htc | head -30   # custom_ping, blackbox, thermal, ...
+
+# رحلة ذهاب وعودة لأمر WMI المخصص
+D=/sys/kernel/debug/ieee80211/phy$(cat /sys/class/net/wl*/phy80211/index)/ath9k_htc
+echo 1234 | sudo tee $D/custom_ping && cat $D/custom_ping  # pings=1, pong=1
+
+# مجموعة القبول الكاملة: المتوقع 51 PASS / 2 FAIL موثقين (قراءة ack_timeout)
+sudo ./scripts/test-all.sh
+```
+
+## ⚠️ القيود المعروفة
+
+- **`ack_timeout` مش بيحتفظ بقيمته** — mac80211 وظل ROM بيعيدوا كتابة الريجستر `0x8014` مع كل
+  wake؛ وده مصدر الـ FAILين الموثقين في الاختبار. متروك عمداً بره النطاق للينكات قصيرة المدى
+  ([docs/13](docs/13-wmi-wedge-root-cause.md), [docs/14](docs/14-stability-pass-final-20261115.md)).
+- **حد WMI على السلك** — أي حزمة تحكم بطول **64 بايت بالظبط** على EP3 بتعلّق متحكم USB؛ كل الردود
+  المخصصة متقصودة تحت الحد ده. أي ميزة WMI جديدة لازم تحترم الحد
+  ([docs/13](docs/13-wmi-wedge-root-cause.md)).
+- **HT40 غير مختبَر** — الـ AP وقت الاختبار كان شغال 20 MHz بس؛ ووضع 20 MHz هو المفضّل للاستقرار
+  أصلاً ([docs/14](docs/14-stability-pass-final-20261115.md)).
+- **القدرة الثابتة (fixed TX power) غير مدعومة** — `iw set txpower fixed` مش بيوصل للعتاد أبداً؛
+  مفيش مسار تطبيق لقدرة الإرسال في ath9k_htc خارج إعداد القناة
+  ([docs/14](docs/14-stability-pass-final-20261115.md)).
+- **`custom_rx_hooks` افتراضياً = 0** — تفعيله أعاد إنتاج توقيع الـ wedge في الاختبارات؛ بيفضل
+  أداة Bisect وقت التشغيل مش افتراضي ([docs/12](docs/12-thermal-batch.md)).
+- **`thermal avg_rssi` بيقرأ 0 مع الـ hooks مقفولة** — عينات RSSI معتمدة على مسار RX hook
+  ([docs/14 §4](docs/14-stability-pass-final-20261115.md)).
+- **استمرارية الفيرموير عند الإقلاع** اتأكدت بالإعدادات مش بإعادة تشغيل فعلية وقت النشر —
+  التفاصيل في [docs/14 §3](docs/14-stability-pass-final-20261115.md).
+- **قفزات RTT متقطعة (35–372 ms بدون فقدان)** بتظهر في كل الإعدادات؛ اتحكم إنها بيئية
+  (قناة مشتركة) ومش متحسومة ([docs/14 §4](docs/14-stability-pass-final-20261115.md)).
+
+## 🙏 المصادر والاعتمادات
+
+- **[open-ath9k-htc-firmware](https://github.com/qca/open-ath9k-htc-firmware)** (Qualcomm Atheros) —
+  شجرة الفيرموير الأصلية تحت `sources/open-ath9k-htc-firmware/` (تراخيص مختلطة: كود Qualcomm
+  Atheros تحت ClearBSD، و`xtos` بتاع Tensilica تحت MIT، وبعض ملفات ECOS تحت GPLv2 مع تحفظات —
+  راجع `LICENCE.TXT`/`NOTICE.TXT`/`README` جواه).
+- **`ath9k`/`ath9k_htc` بتاع لينكس** — شجرة الدرايفر الأصلية تحت
+  `sources/linux-6.12.116-ath9k/` (GPL-2.0، kernel.org v6.12.116).
+- **شغل المشروع نفسه** = الفرق المسجّل في `patches/` والشجر المعدّلة في `sources/`:
+  13 ميزة مقيمة في الفيرموير، إصلاح تعليق WMI لـ 64 بايت، تجيهز debugfs في الدرايفر، إصلاح
+  فكّ الـ NF، والأدوات على جانب الجهاز في `scripts/`. القائمة الكاملة لكل ملف في
+  [sources/README.md](sources/README.md).
 
 ## ⚖️ الترخيص والاستخدام المسؤول
 
